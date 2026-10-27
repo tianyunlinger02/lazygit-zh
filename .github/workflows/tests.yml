@@ -1,0 +1,37 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: ${{ matrix.os }} / Node ${{ matrix.node-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node-version: ["22", "24"]
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: 设置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - name: 安装开发依赖
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: 类型检查
+        run: npm run typecheck
+      - name: Node 测试（含本地 npm 安装）
+        run: npm test
+      - name: 检查发行包
+        run: npm pack --dry-run

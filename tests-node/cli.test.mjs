@@ -1,0 +1,346 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { lstat, open, readFile, readdir, stat, mkdir, writeFile } from 'node:fs/promises';
+import { resolve, join, delimiter } from 'node:path';
+import { runProcess, which } from '../dist/process.js';
+import { configureIdentity, diagnostics, publicKey, setupWizard } from '../dist/setup.js';
+import { dispatch, main, runMenu, VERSION } from '../dist/cli.js';
+import { fileURLToPath } from 'node:url';
+import { fixture, ScriptedConsole } from './support.mjs';
+import { ProfileStore } from '../dist/profiles.js';
+import { Git } from '../dist/git.js';
+
+const cli = fileURLToPath(new URL('../dist/cli.js', import.meta.url));
+const packageVersion = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version;
+async function launch(f, answers, args = [], env = process.env) {
+  const result = await runProcess(process.execPath, [cli, '--path', f.path, ...args], { cwd: f.path, env, inputData: Buffer.from(answers.join('\n') + '\n') });
+  return { ...result, text: result.stdout.toString('utf8') + result.stderr.toString('utf8') };
+}
+test('help/version and invalid flags do not create data or pointer', async t => {
+  const f = await fixture(t);
+  for (const [args, code, pattern] of [[['--help'], 0, /用法/], [['--version'], 0, new RegExp(`autogit ${packageVersion.replaceAll('.', '\\.')}\\b`, 'u')], [['--not-an-option'], 2, /参数错误/]]) {
+    const result = await launch(f, [], args); assert.equal(result.status, code, result.text); assert.match(result.text, pattern);
+  }
+  await assert.rejects(stat(process.env.AUTOGIT_DATA_DIR), /ENOENT/); assert.deepEqual(await readdir(f.home), []);
+});
+test('version follows the package and main menu preserves 1-13 while appending advanced actions 14-21', async t => {
+  const f = await fixture(t);
+  assert.equal(VERSION, packageVersion);
+  const ui = new ScriptedConsole(['0']);
+  await runMenu(ui, f.path);
+  const labels = ['首次配置', '下载已有项目', '上传本地项目', '保存修改并上传', '获取远程最新代码', '查看状态', '分支与合并', '检查配置', '切换当前项目', '账号与密钥', '临时收起', '仅保存到本地', '使用设置', '仅上传已有提交', '撤销、还原和清理', '远程与强推工具', '进行中的操作', '历史与恢复', 'GitHub 协作', '项目收藏与最近使用', '项目工具'];
+  for (const [index, label] of labels.entries()) assert.ok(ui.transcript.includes(`  ${index + 1}. ${label}`), label);
+  assert.deepEqual(ui.answers, []);
+});
+
+test('public CLI accepts multiple piped menu lines, remembers mode and exits on EOF', async t => {
+  const f = await fixture(t);
+  const first = await launch(f, ['13', '2', '6', '1', '0']);
+  assert.equal(first.status, 0, first.text); assert.match(first.text, /已启用详细确认模式/); assert.match(first.text, /工作区干净/); assert.match(first.text, /已退出/);
+  const preferences = JSON.parse(await readFile(join(process.env.AUTOGIT_DATA_DIR, 'settings.json'), 'utf8'));
+  assert.equal(preferences.interaction_mode, 'confirm'); assert.equal(preferences.last_project, f.path);
+  const again = await launch(f, []); assert.equal(again.status, 0, again.text); assert.match(again.text, /详细模式/); assert.doesNotMatch(again.text, /保管好你的 AutoGit 文件夹/);
+});
+test('public CLI --app-dir outranks AUTOGIT_DATA_DIR without locator', async t => {
+  const f = await fixture(t); const root = join(f.base, '独立 AutoGit');
+  const result = await launch(f, ['0'], ['--app-dir', root]); assert.equal(result.status, 0, result.text);
+  assert.match(result.text, /独立 AutoGit/); assert.equal((await stat(join(root, 'data', 'settings.json'))).isFile(), true);
+  await assert.rejects(stat(process.env.AUTOGIT_DATA_DIR), /ENOENT/); assert.deepEqual(await readdir(f.home), []);
+});
+test('public first-run folder locator is path-only and reused from another cwd', async t => {
+  const f = await fixture(t); const env = { ...process.env }; delete env.AUTOGIT_DATA_DIR;
+  const root = join(f.base, '资料 根'); const first = await launch(f, [root, '0'], [], env);
+  assert.equal(first.status, 0, first.text);
+  const pointer = process.platform === 'win32' ? join(env.APPDATA, 'AutoGit/location.json') : join(env.XDG_CONFIG_HOME, 'autogit/location.json');
+  assert.deepEqual(JSON.parse(await readFile(pointer)), { schema_version: 1, appRoot: root });
+  const second = await runProcess(process.execPath, [cli], { cwd: f.base, env, inputData: Buffer.from('0\n') });
+  assert.equal(second.status, 0, second.stderr.toString()); assert.match(second.stdout.toString(), /当前目录：.*中文 项目/); assert.ok(!second.stdout.toString().includes('软件根目录 ['));
+});
+test('public CLI cancels file selection without staging or committing', async t => {
+  const f = await fixture(t); await f.write(); const result = await launch(f, ['12', ':q', '0']); assert.equal(result.status, 0, result.text); assert.match(result.text, /已返回菜单/); assert.equal(await f.git.hasCommits(), false); assert.equal((await f.git.changes())[0].staged, false);
+});
+test('public CLI generates a managed remembered account, binds and commits with no Python', { skip: !which('ssh') || !which('ssh-keygen') }, async t => {
+  const f = await fixture(t); await f.write();
+  const result = await launch(f, ['10', '1', 'y', '测试软件账号', 'Managed User', 'managed@example.invalid', 'fixture-login', '4', '1', '0', '12', 'a', 'Node CLI commit', '0']);
+  assert.equal(result.status, 0, result.text); assert.match(result.text, /已保存账号/); assert.match(result.text, /ssh-ed25519 /); assert.match(result.text, /https:\/\/github.com\/settings\/keys/);
+  assert.equal(await f.git.value('log', '-1', '--format=%an <%ae>'), 'Managed User <managed@example.invalid>');
+  assert.equal(await f.git.config('user.name'), '测试用户');
+  const ids = await readdir(join(process.env.AUTOGIT_DATA_DIR, 'profiles')); assert.equal(ids.length, 1);
+  const profile = JSON.parse(await readFile(join(process.env.AUTOGIT_DATA_DIR, 'profiles', ids[0], 'profile.json'))); assert.equal(profile.schema_version, 2); assert.equal(profile.remember_auth, true); assert.ok(!resolve(profile.private_key).startsWith(process.env.AUTOGIT_DATA_DIR));
+  const key = join(process.env.AUTOGIT_DATA_DIR, profile.private_key); const derived = await runProcess('ssh-keygen', ['-y', '-P', '', '-f', key], { cwd: f.base, inputData: Buffer.alloc(0) }); assert.equal(derived.status, 0);
+  await assert.rejects(stat(join(f.home, '.ssh')), /ENOENT/);
+});
+test('public CLI pushes local bare repo then handles real merge conflict and declined abort', async t => {
+  const f = await fixture(t); await f.write('shared.txt', 'base\n'); await f.commit(); const bare = await f.remote();
+  const pushed = await launch(f, ['4', '1', '', '0']); assert.equal(pushed.status, 0, pushed.text); assert.match(pushed.text, /推送成功/);
+  await f.git.run(['switch', '-c', 'topic']); await f.write('shared.txt', 'topic\n'); await f.commit('topic'); await f.git.run(['switch', 'main']); await f.write('shared.txt', 'main\n'); await f.commit('main');
+  const conflict = await launch(f, ['7', '7', '1', '7', '8', '4', 'n', '0']); assert.equal(conflict.status, 0, conflict.text); assert.match(conflict.text, /合并产生冲突/); assert.equal(await f.git.operation(), 'MERGE_HEAD');
+  await f.write('shared.txt', 'resolved\n');
+  const resolved = await launch(f, ['7', '8', '2', 'a', '7', '8', '3', '0']); assert.equal(resolved.status, 0, resolved.text); assert.match(resolved.text, /合并提交已创建/); assert.equal(await f.git.operation(), ''); assert.equal((await f.git.value('rev-list', '--parents', '-n', '1', 'HEAD')).split(' ').length, 3);
+  const remote = await runProcess('git', ['--git-dir', bare, 'rev-parse', 'main'], { cwd: f.base, inputData: Buffer.alloc(0) }); assert.notEqual(remote.stdout.toString().trim(), await f.git.value('rev-parse', 'HEAD'));
+});
+test('public CLI carries staged and unstaged work into a new branch without confirmation or stash', async t => {
+  const f = await fixture(t, { committed: true });
+  await f.write('hello.txt', 'staged work\n'); await f.git.stagePaths(['hello.txt']);
+  await f.write('hello.txt', 'staged work plus unstaged edits\n');
+  await f.write('draft.txt', 'untracked draft\n');
+  const index = (await f.git.run(['diff', '--cached', '--binary'])).stdout;
+  const before = await f.git.value('rev-parse', 'HEAD');
+  const result = await launch(f, ['7', '2', 'in-progress', '0']);
+  assert.equal(result.status, 0, result.text);
+  assert.match(result.text, /已新建并切换到 in-progress/u);
+  assert.doesNotMatch(result.text, /\[y\/N\]|操作未完成|请输入 0 到/u);
+  assert.equal(await f.git.branch(), 'in-progress');
+  assert.equal(await f.git.value('rev-parse', 'HEAD'), before);
+  assert.deepEqual((await f.git.run(['diff', '--cached', '--binary'])).stdout, index);
+  assert.equal(await readFile(join(f.path, 'hello.txt'), 'utf8'), 'staged work plus unstaged edits\n');
+  assert.equal(await readFile(join(f.path, 'draft.txt'), 'utf8'), 'untracked draft\n');
+  assert.equal(await f.git.value('stash', 'list'), '');
+});
+
+test('public CLI HTTPS setup does not ask irrelevant SSH fields in quick mode', async t => {
+  const f = await fixture(t);
+  const result = await launch(f, ['21', '5', '1', '1', '3', '0', '0']);
+  assert.equal(result.status, 0, result.text);
+  assert.match(result.text, /已保存本项目配置/u);
+  assert.doesNotMatch(result.text, /SSH endpoint 主机|SSH 端口|SSH 用户|已有 SSH Host alias|操作未完成|请输入 0 到/u);
+  const hosts = JSON.parse(await readFile(join(process.env.AUTOGIT_DATA_DIR, 'hosts.json'), 'utf8'));
+  assert.equal(hosts.projects[f.path].mode, 'https');
+});
+
+async function largeFile(f, name = 'oversized.bin') {
+  const file = join(f.path, name), handle = await open(file, 'w');
+  try { await handle.truncate(50 * 1024 * 1024 + 1); } finally { await handle.close(); }
+  return file;
+}
+
+test('public CLI automatically ignores oversized new files before local commit with no LFS or extra confirmation', async t => {
+  const f = await fixture(t); await f.write('small.txt', 'small file\n'); const large = await largeFile(f);
+  const result = await launch(f, ['12', 'a', 'small files only', '0']);
+  assert.equal(result.status, 0, result.text); assert.match(result.text, /已自动忽略.*oversized\.bin/u); assert.match(result.text, /已保存到本地/u);
+  assert.doesNotMatch(result.text, /\[y\/N\]|操作未完成|请输入 0 到|git-lfs|LFS 工具/u);
+  assert.equal((await lstat(large)).size, 50 * 1024 * 1024 + 1);
+  assert.equal(await f.git.value('ls-tree', '-r', '--name-only', 'HEAD'), '.gitignore\nsmall.txt');
+  assert.equal(await f.git.value('show', 'HEAD:.gitignore'), '/oversized.bin');
+  assert.equal((await f.git.run(['--no-literal-pathspecs', 'check-ignore', '-z', '--stdin'], { inputData: Buffer.from('oversized.bin\0') })).stdout.toString(), 'oversized.bin\0');
+  await assert.rejects(stat(join(f.path, '.gitattributes')), { code: 'ENOENT' });
+  const before = await readFile(join(f.path, '.gitignore'));
+  const second = await launch(f, ['12', '0']); assert.equal(second.status, 0, second.text); assert.match(second.text, /工作区干净/u);
+  assert.deepEqual(await readFile(join(f.path, '.gitignore')), before); assert.equal(await f.git.value('rev-list', '--count', 'HEAD'), '1');
+});
+
+test('public CLI save and push excludes oversized new files from a real local bare remote', async t => {
+  const f = await fixture(t, { committed: true }); const bare = await f.remote(); await f.write('small.txt', 'small update\n'); await largeFile(f);
+  const result = await launch(f, ['4', 'a', 'skip oversized asset', '1', '', '0']);
+  assert.equal(result.status, 0, result.text); assert.match(result.text, /已自动忽略/u); assert.match(result.text, /推送成功/u);
+  assert.doesNotMatch(result.text, /\[y\/N\]|操作未完成|请输入 0 到|git-lfs|LFS 工具/u);
+  const remote = new Git(bare);
+  assert.equal(await remote.value('rev-parse', 'main'), await f.git.value('rev-parse', 'HEAD'));
+  assert.equal(await remote.value('ls-tree', '-r', '--name-only', 'main'), '.gitignore\nhello.txt\nsmall.txt');
+  assert.equal((await lstat(join(f.path, 'oversized.bin'))).size, 50 * 1024 * 1024 + 1);
+});
+
+test('public CLI auto ignore preserves partial staging of gitignore and only commits its existing index version', async t => {
+  const f = await fixture(t, { committed: true }); await f.write('.gitignore', '# index version\n'); await f.git.stagePaths(['.gitignore']);
+  await f.write('.gitignore', '# index version\n# worktree only\n'); await largeFile(f); await f.write('small.txt', 'small\n');
+  const result = await launch(f, ['12', 'a', 'preserve ignore index', '0']);
+  assert.equal(result.status, 0, result.text); assert.match(result.text, /保留已暂存版本/u); assert.match(result.text, /已保存到本地/u);
+  assert.equal((await f.git.run(['show', 'HEAD:.gitignore'])).stdout.toString(), '# index version\n');
+  assert.equal(await readFile(join(f.path, '.gitignore'), 'utf8'), '# index version\n# worktree only\n/oversized.bin\n');
+  assert.equal(await f.git.value('ls-tree', '-r', '--name-only', 'HEAD'), '.gitignore\nhello.txt\nsmall.txt');
+  assert.doesNotMatch(result.text, /\[y\/N\]|操作未完成|请输入 0 到/u);
+});
+
+test('public CLI action 14 uploads only existing commits and does not save dirty worktree files', async t => {
+  const f = await fixture(t, { committed: true });
+  const bare = await f.remote();
+  const head = await f.git.value('rev-parse', 'HEAD');
+  await f.write('not-saved.txt', 'must remain local\n');
+  const result = await launch(f, ['14', '1', '', '0']);
+  assert.equal(result.status, 0, result.text);
+  assert.match(result.text, /推送成功/u);
+  assert.equal(await new Git(bare).value('rev-parse', 'refs/heads/main'), head);
+  assert.equal(await f.git.value('rev-parse', 'HEAD'), head);
+  assert.deepEqual((await f.git.changes()).map(change => change.path), ['not-saved.txt']);
+});
+
+test('public CLI menu 15 unstage, reset and clean honor hard cancellation and mutate only confirmed targets', async t => {
+  const f = await fixture(t, { committed: true });
+  const initial = await f.git.value('rev-parse', 'HEAD');
+  await f.write('hello.txt', 'second committed version\n');
+  await f.commit('second CLI snapshot');
+  await f.write('hello.txt', 'dirty but staged later\n');
+  await f.git.stagePaths(['hello.txt']);
+  await f.write('untracked.txt', 'must remain\n');
+  const beforeHead = await f.git.value('rev-parse', 'HEAD');
+  const stagedBefore = (await f.git.run(['diff', '--cached', '--name-only', '-z'])).stdout;
+  let result = await launch(f, ['15', '2', 'a', 'n', '0']);
+  assert.equal(result.status, 0, result.text);
+  assert.deepEqual((await f.git.run(['diff', '--cached', '--name-only', '-z'])).stdout, stagedBefore);
+  assert.equal(await f.git.value('rev-parse', 'HEAD'), beforeHead);
+  result = await launch(f, ['15', '4', '2', '3', 'n', '0']);
+  assert.equal(result.status, 0, result.text);
+  assert.equal(await f.git.value('rev-parse', 'HEAD'), beforeHead);
+  result = await launch(f, ['15', '5', '1', '1', 'n', '0']);
+  assert.equal(result.status, 0, result.text);
+  assert.equal(await readFile(join(f.path, 'untracked.txt'), 'utf8'), 'must remain\n');
+  assert.equal(await readFile(join(f.path, 'hello.txt'), 'utf8'), 'dirty but staged later\n');
+  assert.match(result.text, /clean/u);
+  result = await launch(f, ['15', '2', 'a', 'y', '0']);
+  assert.equal(result.status, 0, result.text);
+  assert.match(result.text, /已取消所选路径的暂存/u);
+  assert.equal((await f.git.run(['diff', '--cached', '--name-only'])).stdout.length, 0);
+  assert.equal(await readFile(join(f.path, 'hello.txt'), 'utf8'), 'dirty but staged later\n');
+  result = await launch(f, ['15', '4', '2', '3', 'y', '0']);
+  assert.equal(result.status, 0, result.text);
+  assert.match(result.text, /reset --hard 已完成/u);
+  assert.equal(await f.git.value('rev-parse', 'HEAD'), initial);
+  assert.equal(await readFile(join(f.path, 'hello.txt'), 'utf8'), 'first\n');
+  assert.equal(await readFile(join(f.path, 'untracked.txt'), 'utf8'), 'must remain\n');
+  result = await launch(f, ['15', '5', '1', '1', 'y', '0']);
+  assert.equal(result.status, 0, result.text);
+  assert.match(result.text, /clean 已完成/u);
+  await assert.rejects(stat(join(f.path, 'untracked.txt')), { code: 'ENOENT' });
+  assert.equal(await f.git.value('rev-parse', 'HEAD'), initial);
+  assert.deepEqual(await f.git.changes(), []);
+});
+
+test('public CLI menu 16 performs real lease and unconditional force against a local bare remote', async t => {
+  const f = await fixture(t, { committed: true });
+  const bare = await f.remote();
+  await f.git.run(['push', 'origin', 'main']);
+  const peerPath = join(f.base, 'cli-peer');
+  await new Git(f.base).run(['clone', '--', bare, peerPath]);
+  const peer = new Git(peerPath);
+  await peer.run(['config', 'user.name', 'CLI Peer']);
+  await peer.run(['config', 'user.email', 'cli-peer@example.invalid']);
+  await f.write('local-cli.txt', 'local branch\n');
+  await f.commit('local CLI divergence');
+  await writeFile(join(peerPath, 'peer-cli.txt'), 'peer branch\n');
+  await peer.stagePaths(['peer-cli.txt']);
+  await peer.run(['commit', '-m', 'peer CLI divergence']);
+  const peerHead = await peer.value('rev-parse', 'HEAD');
+  await peer.run(['push', 'origin', 'main']);
+  const localHead = await f.git.value('rev-parse', 'HEAD');
+  const env = { ...process.env, GIT_ALLOW_PROTOCOL: 'file' };
+  const server = new Git(bare);
+  const leased = await launch(f, ['16', '4', '1', 'main', '1', 'y', '0'], [], env);
+  assert.equal(leased.status, 0, leased.text);
+  assert.match(leased.text, /强推成功/u);
+  assert.equal(await server.value('rev-parse', 'refs/heads/main'), localHead);
+  await server.run(['update-ref', 'refs/heads/main', peerHead]);
+  const forced = await launch(f, ['16', '4', '1', 'main', '2', 'y', '0'], [], env);
+  assert.equal(forced.status, 0, forced.text);
+  assert.match(forced.text, /强推成功/u);
+  assert.equal(await server.value('rev-parse', 'refs/heads/main'), localHead);
+  assert.equal(await f.git.value('rev-parse', 'HEAD'), localHead);
+  for (const result of [leased, forced]) {
+    assert.match(result.text, new RegExp(peerHead));
+    assert.match(result.text, new RegExp(localHead));
+    assert.doesNotMatch(result.text, /--follow-tags/u);
+  }
+});
+
+test('advanced external identity decline is inert; confirmed writes are scoped and deduplicated', async t => {
+  const f = await fixture(t); assert.equal(await configureIdentity(new ScriptedConsole(['1', 'Changed', 'changed@example.invalid', 'n']), f.path), false); assert.equal(await f.git.config('user.name'), '测试用户');
+  assert.equal(await configureIdentity(new ScriptedConsole(['1', 'Changed', 'changed@example.invalid', 'y']), f.path), true); assert.equal(await f.git.config('user.name'), 'Changed');
+  assert.equal(await configureIdentity(new ScriptedConsole(['1', '', '']), f.path), true);
+  assert.equal((await f.git.value('config', '--get-all', 'user.name')).split('\n').length, 1);
+});
+test('local diagnostics redacts external credentials and never authenticates', async t => {
+  const f = await fixture(t); await f.git.run(['remote', 'add', 'origin', 'https://user:secret@github.com/a/b?token=secret']); const ui = new ScriptedConsole(); await diagnostics(ui, f.path); assert.match(ui.transcript, /本地诊断/); assert.doesNotMatch(ui.transcript, /secret/); assert.match(ui.transcript, /凭据已隐藏/);
+});
+test('public key helper refuses private file, malformed contents and oversized .pub', async t => {
+  const f = await fixture(t); const ui = new ScriptedConsole(); await publicKey(ui, join(f.base, 'private')); const file = join(f.base, 'bad.pub'); await writeFile(file, 'PRIVATE SECRET'); await publicKey(ui, file); await writeFile(file, 'X'.repeat(65537)); await publicKey(ui, file); assert.doesNotMatch(ui.transcript, /PRIVATE SECRET/);
+});
+test('advanced setup menu and main dispatch allow returning without changes', async t => {
+  const f = await fixture(t); await setupWizard(new ScriptedConsole(['0']), f.path); assert.equal(await dispatch(new ScriptedConsole(['0']), f.path, 1), f.path); assert.equal(await main(['--version'], new ScriptedConsole()), 0);
+});
+
+async function creationCliFixture(t) {
+  const f = await fixture(t);
+  const realGit = which('git');
+  assert.ok(realGit);
+  const tools = join(f.base, 'fake tools'); await mkdir(tools);
+  await writeFile(join(tools, 'package.json'), '{"type":"commonjs"}\n');
+  const ghLog = join(f.base, 'gh-calls.jsonl');
+  const pushLog = join(f.base, 'push-calls.jsonl');
+  const bare = join(f.base, 'creation-target.git'); await mkdir(bare);
+  await new Git(bare).run(['init', '--bare', '--initial-branch=main']);
+  const store = new ProfileStore();
+  const profile = await store.create(new ScriptedConsole(['y']), 'CLI fixture', 'Managed CLI', 'cli@example.invalid', 'fixture-login', { remember_auth: true });
+  assert.ok(profile); await store.bind(f.path, profile.profile_id);
+  await writeFile(join(tools, 'gh'), `#!/usr/bin/env node
+const fs = require('node:fs');
+const assert = require('node:assert/strict');
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.AUTOGIT_TEST_GH_LOG, JSON.stringify({ args, host: process.env.GH_HOST, config: process.env.GH_CONFIG_DIR }) + '\\n');
+assert.equal(process.env.GH_HOST, 'github.com');
+assert.equal(process.env.GH_TOKEN, undefined);
+const full = 'fixture-login/' + process.env.AUTOGIT_TEST_REPO;
+if (JSON.stringify(args) === JSON.stringify(['api', '--hostname', 'github.com', '--method', 'GET', 'user', '--jq', '.login'])) {
+  process.stdout.write('fixture-login\\n');
+} else if (JSON.stringify(args) === JSON.stringify(['repo', 'create', full, '--' + process.env.AUTOGIT_TEST_VISIBILITY])) {
+  fs.writeFileSync(process.env.AUTOGIT_TEST_CREATED, full);
+  process.stdout.write('Created fixture repository\\n');
+} else if (JSON.stringify(args) === JSON.stringify(['api', '--hostname', 'github.com', '--method', 'GET', 'repos/' + full, '--jq', '{owner: {login: .owner.login}, name: .name, full_name: .full_name, private: .private, html_url: .html_url, ssh_url: .ssh_url, clone_url: .clone_url}'])) {
+  assert.equal(fs.readFileSync(process.env.AUTOGIT_TEST_CREATED, 'utf8'), full);
+  process.stdout.write(JSON.stringify({ name: process.env.AUTOGIT_TEST_REPO, full_name: full, owner: {login: 'fixture-login'}, private: process.env.AUTOGIT_TEST_VISIBILITY === 'private', html_url: 'https://github.com/' + full, ssh_url: 'git@github.com:' + full + '.git', clone_url: 'https://github.com/' + full + '.git' }));
+} else { throw new Error('Unexpected fake gh command'); }
+`, { mode: 0o700 });
+  await writeFile(join(tools, 'git'), `#!/usr/bin/env node
+const fs = require('node:fs');
+const { spawnSync } = require('node:child_process');
+const args = process.argv.slice(2);
+if (args.some(a => ['fetch', 'pull', 'clone'].includes(a)) || args.includes('ls-remote') && !args.includes('--get-url')) {
+  throw new Error('Network Git operation blocked by CLI fixture');
+}
+if (args.includes('push')) {
+  if (args.at(-2) !== 'origin' || !/^[a-f0-9]{40,64}:refs\\/heads\\/main$/u.test(args.at(-1))) throw new Error('Unexpected push target');
+  if (args.some(arg => /^(?:--force|--mirror|\\+)/u.test(arg)) || !args.includes('--no-follow-tags') || args.includes('--set-upstream')) throw new Error('Unexpected force, tag or upstream push option');
+  fs.appendFileSync(process.env.AUTOGIT_TEST_PUSH_LOG, JSON.stringify(args) + '\\n');
+  args.unshift('-c', 'remote.origin.pushurl=' + process.env.AUTOGIT_TEST_BARE);
+}
+const result = spawnSync(process.env.AUTOGIT_TEST_REAL_GIT, args, {stdio: 'inherit', env: process.env});
+process.exit(result.status ?? 1);
+`, { mode: 0o700 });
+  return { ...f, ghLog, pushLog, bare, env: { ...process.env, PATH: `${tools}${delimiter}${process.env.PATH ?? ''}`, AUTOGIT_TEST_GH_LOG: ghLog, AUTOGIT_TEST_PUSH_LOG: pushLog, AUTOGIT_TEST_CREATED: join(f.base, 'created.txt'), AUTOGIT_TEST_REAL_GIT: realGit, AUTOGIT_TEST_BARE: bare } };
+}
+
+for (const [visibility, choice] of [['private', '1'], ['public', '2']]) {
+  test(`public CLI creates a ${visibility} fixture repository, links and uploads offline`, { skip: process.platform === 'win32' || !which('ssh') || !which('ssh-keygen') }, async t => {
+    const f = await creationCliFixture(t); await f.write();
+    const repo = `cli-${visibility}`;
+    const env = { ...f.env, AUTOGIT_TEST_REPO: repo, AUTOGIT_TEST_VISIBILITY: visibility };
+    const result = await launch(f, ['3', '', '1', '', repo, choice, 'y', 'a', `create ${visibility}`, '', '0'], [], env);
+    assert.equal(result.status, 0, result.text);
+    assert.match(result.text, /推送成功/u);
+    assert.match(result.text, /已退出/u);
+    assert.equal(await f.git.config('remote.origin.url'), `git@github.com:fixture-login/${repo}.git`);
+    assert.equal(await f.git.config('branch.main.remote'), 'origin');
+    assert.equal(await f.git.value('rev-parse', 'HEAD'), await new Git(f.bare).value('rev-parse', 'main'));
+    assert.equal(await f.git.value('log', '-1', '--format=%an <%ae>'), 'Managed CLI <cli@example.invalid>');
+    assert.equal(await f.git.config('user.name'), '测试用户');
+    const calls = (await readFile(f.ghLog, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    const writes = calls.filter(call => call.args[0] === 'repo');
+    assert.deepEqual(writes.map(call => call.args), [['repo', 'create', `fixture-login/${repo}`, `--${visibility}`]]);
+    assert.ok(calls.some(call => call.args.includes(`repos/fixture-login/${repo}`)));
+    assert.ok(calls.every(call => call.host === 'github.com' && call.config === env.GH_CONFIG_DIR));
+    assert.equal((await readFile(f.pushLog, 'utf8')).trim().split('\n').length, 1);
+    if (process.env.AUTOGIT_VERIFICATION_DIR) {
+      await writeFile(join(process.env.AUTOGIT_VERIFICATION_DIR, `cli-creation-${visibility}-${packageVersion}.txt`), `OFFLINE FIXTURE ONLY: fake gh and a real local bare Git target.\n${result.text}\nFake gh calls:\n${JSON.stringify(calls, null, 2)}\n`);
+    }
+  });
+}
+
+test('public CLI declining final public creation makes no repository and no push', { skip: process.platform === 'win32' || !which('ssh') || !which('ssh-keygen') }, async t => {
+  const f = await creationCliFixture(t);
+  const env = { ...f.env, AUTOGIT_TEST_REPO: 'cancelled-public', AUTOGIT_TEST_VISIBILITY: 'public' };
+  const result = await launch(f, ['3', '', '1', '', 'cancelled-public', '2', 'n', '0'], [], env);
+  assert.equal(result.status, 0, result.text); assert.match(result.text, /已退出/u);
+  assert.deepEqual(await f.git.remotes(), []);
+  const calls = (await readFile(f.ghLog, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  assert.ok(calls.length > 0); assert.ok(calls.every(call => call.args[0] === 'api'));
+  await assert.rejects(stat(env.AUTOGIT_TEST_CREATED), {code: 'ENOENT'});
+  await assert.rejects(stat(f.pushLog), {code: 'ENOENT'});
+});
