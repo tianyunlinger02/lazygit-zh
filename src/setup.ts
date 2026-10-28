@@ -12,8 +12,8 @@ export const FINGERPRINTS_URL = 'https://docs.github.com/en/authentication/keepi
 export function dependencies(ui: Console): void {
   ui.title('依赖检查（不自动安装）');
   for (const name of ['git', 'ssh-keygen', 'ssh', 'gh']) ui.text(`${name}${name === 'gh' ? '（可选）' : '（必需）'}：${which(name) ?? '未找到'}`);
-  ui.text('Windows：安装 Git for Windows，启用系统“可选功能”里的 OpenSSH 客户端，重新打开终端。');
-  ui.text('Linux：用发行版包管理器安装 Git 和 OpenSSH 客户端，例如 Debian/Ubuntu 的 git、openssh-client。');
+  ui.text('Windows：可使用用户级或便携 Git for Windows 自带的 OpenSSH；无需为 AutoGit 登录启用系统可选功能或请求管理员。把工具加入个人 PATH 后重新打开终端。');
+  ui.text('Linux：使用已有 Git/OpenSSH、用户级工具环境或用户可用的安装方式；发行版包管理器是可选的依赖安装方式，不是 AutoGit 的管理员认证前置。');
   ui.text('GitHub CLI（gh）：自动创建仓库需要它；已有仓库的 Git/SSH 操作不需要。本软件不自动安装。');
   ui.text('安装指引：https://cli.github.com/；Windows 可用官方安装包，Linux 按官方发行版指引安装。');
 }

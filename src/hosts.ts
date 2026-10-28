@@ -2,6 +2,7 @@ import * as path from 'node:path';
 import { appDataDir } from './app-context.js';
 import { Git, GitError } from './git.js';
 import { Cancelled, type Console } from './ui.js';
+import { currentSession } from './session.js';
 import { checkedPath, exactKeys, MISSING, readJson, record, text, withStoreLock, writeJson } from './storage.js';
 
 export type HostProvider = 'github' | 'github-enterprise' | 'generic';
@@ -16,7 +17,7 @@ export interface HostOptions {
   sshUser?: string;
   sshAlias?: string;
 }
-export interface TransportTarget { mode: TransportMode; host: HostOptions }
+export interface TransportTarget { mode: TransportMode; host: HostOptions; credentials?: 'external' }
 export const DEFAULT_HOST: HostOptions = { provider: 'github', host: 'github.com', apiHost: 'api.github.com', webBase: 'https://github.com', sshHost: 'github.com' };
 export const DEFAULT_TRANSPORT: TransportTarget = { mode: 'managed-ssh', host: DEFAULT_HOST };
 const HOST_KEYS = ['provider', 'host', 'apiHost', 'webBase', 'sshHost'];
@@ -33,7 +34,7 @@ function sshName(value: unknown): string {
   return result;
 }
 export function validateTransport(value: unknown): TransportTarget {
-  if (!record(value) || !exactKeys(value, ['mode', 'host']) || !['managed-ssh', 'native-ssh', 'https'].includes(String(value.mode)) || !record(value.host)) throw new GitError('项目传输配置无效。');
+  if (!record(value) || !['mode', 'host'].every(key => Object.hasOwn(value, key)) || Object.keys(value).some(key => !['mode', 'host', 'credentials'].includes(key)) || !['managed-ssh', 'native-ssh', 'https'].includes(String(value.mode)) || !record(value.host) || Object.hasOwn(value, 'credentials') && (value.mode !== 'https' || value.credentials !== 'external')) throw new GitError('项目传输配置无效。');
   const host = value.host;
   if (!HOST_KEYS.every((key) => Object.hasOwn(host, key)) || Object.keys(host).some((key) => ![...HOST_KEYS, ...OPTIONAL_KEYS].includes(key)) || !['github', 'github-enterprise', 'generic'].includes(String(host.provider))) throw new GitError('主机配置结构无效。');
   if (value.mode === 'native-ssh' && host.provider === 'generic') sshName(host.host); else hostname(host.host);
@@ -47,7 +48,7 @@ export function validateTransport(value: unknown): TransportTarget {
   if (host.sshPort !== undefined && (!Number.isInteger(host.sshPort) || Number(host.sshPort) < 1 || Number(host.sshPort) > 65535)) throw new GitError('SSH 端口必须是 1–65535。');
   if (host.sshUser !== undefined && !/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/u.test(text(host.sshUser))) throw new GitError('SSH 用户名无效。');
   if (host.sshAlias !== undefined) sshName(host.sshAlias);
-  return { mode: value.mode as TransportMode, host: { ...host } as unknown as HostOptions };
+  return { mode: value.mode as TransportMode, host: { ...host } as unknown as HostOptions, ...(value.credentials === 'external' ? { credentials: 'external' as const } : {}) };
 }
 export async function projectRoot(directory: string): Promise<string> {
   const root = (await new Git(directory).root()).toString();
@@ -113,11 +114,12 @@ export async function hostsMenu(ui: Console, directory: string): Promise<void> {
       if (choice === 2) { ui.text(JSON.stringify(current ?? DEFAULT_TRANSPORT, null, 2)); continue; }
       if (choice === 3) { if (await ui.confirm('移除当前项目的主机与传输配置？不修改 Git remote 或 SSH config。')) await store.set(directory, undefined); continue; }
       const provider = await ui.menu('服务提供方', ['GitHub.com', 'GitHub Enterprise（明确指定主机）', '通用 Git（含 GitLab 等；不提供 GitHub PR API）']); if (!provider) continue;
-      const mode = await ui.menu('认证与传输模式', ['托管 SSH（软件密钥和独立 known_hosts）', '原生 SSH（沿用已有 SSH config、代理和跳板）', 'HTTPS（使用现有凭据助手，不存令牌）']); if (!mode) continue;
+      const mode = await ui.menu('认证与传输模式', ['托管 SSH（软件密钥和独立 known_hosts）', '原生 SSH（外部管理：已有 SSH config、代理和跳板）', currentSession() ? 'HTTPS（本次加密库凭据助手，需绑定账号并录入 Token）' : 'HTTPS（旧版外部凭据助手）', 'HTTPS 外部管理（明确沿用现有凭据助手，不纳入加密库）']); if (!mode) continue;
       const rawHost = provider === 1 ? 'github.com' : await ui.ask('仓库网页主机（通用原生 SSH 可用 alias）', current?.host.host);
       const host = mode === 2 && provider === 3 ? sshName(rawHost) : hostname(rawHost);
       const providerValue = (['github', 'github-enterprise', 'generic'] as const)[provider - 1];
-      const modeValue = (['managed-ssh', 'native-ssh', 'https'] as const)[mode - 1];
+      const modeValue = (['managed-ssh', 'native-ssh', 'https', 'https'] as const)[mode - 1];
+      const externalHttps = modeValue === 'https' && (!currentSession() || mode === 4);
       const previousHost = current?.host.provider === providerValue && current.host.host === host ? current.host : undefined;
       const apiHost = provider === 1 ? 'api.github.com' : provider === 2 ? hostname(await ui.ask('Enterprise API 主机（通常与网页相同）', host)) : '';
       const webBase = provider === 1 ? 'https://github.com' : await ui.ask('网页基础地址', `https://${host}`);
@@ -132,9 +134,9 @@ export async function hostsMenu(ui: Console, directory: string): Promise<void> {
         user = await ui.ask('SSH 用户（空值沿用配置/默认 git）', '', { allowEmpty: true });
         if (modeValue === 'native-ssh') alias = await ui.ask('已有 SSH Host alias（可空，仅原生模式使用）', '', { allowEmpty: true });
       }
-      const target = validateTransport({ mode: modeValue, host: { provider: providerValue, host, apiHost, webBase, sshHost, ...(port ? { sshPort: /^\d+$/u.test(port) ? Number(port) : NaN } : {}), ...(user ? { sshUser: user } : {}), ...(alias ? { sshAlias: alias } : {}) } });
+      const target = validateTransport({ mode: modeValue, ...(mode === 4 ? { credentials: 'external' } : {}), host: { provider: providerValue, host, apiHost, webBase, sshHost, ...(port ? { sshPort: /^\d+$/u.test(port) ? Number(port) : NaN } : {}), ...(user ? { sshUser: user } : {}), ...(alias ? { sshAlias: alias } : {}) } });
       await store.set(directory, target);
-      ui.text('已保存本项目配置；不会改写现有 remote。原生模式允许现有 Host / ProxyCommand / ProxyJump；配置的 alias 需用于远程地址。HTTPS 凭据仍由外部工具管理。');
+      ui.text(`已保存本项目配置；不会改写现有 remote。原生模式允许现有 Host / ProxyCommand / ProxyJump；配置的 alias 需用于远程地址。${modeValue === 'https' && !externalHttps ? 'HTTPS 仅使用当前加密库；请绑定账号并在“HTTPS / GitHub 凭据”录入 Token。' : '外部 SSH / HTTPS 缓存不纳入加密库，退出 AutoGit 不会清除它们。'}`);
     } catch (error) { if (error instanceof Cancelled) ui.text('已返回，未保存配置。'); else if (error instanceof GitError || error instanceof Error && 'code' in error) ui.text(`主机配置未完成：${error.message}`); else throw error; }
   }
 }

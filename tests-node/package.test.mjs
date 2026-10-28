@@ -14,6 +14,7 @@ import { fixture } from './support.mjs';
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const packageName = 'autogit-cn';
 const version = JSON.parse(await readFile(path.join(repoRoot, 'package.json'), 'utf8')).version;
+const retiredRuntime = ['branches', 'destructive', 'operations', 'stash', 'worktrees', 'submodules', 'lfs'].map(name => `dist/${name}.js`);
 
 function npmCli() {
   const configured = process.env.npm_execpath;
@@ -191,12 +192,18 @@ test('packed release allowlist and isolated npm install lifecycle', async (t) =>
   const distFiles = (await filesUnder(path.join(repoRoot, 'dist')))
     .filter((name) => name.endsWith('.js'))
     .map((name) => `dist/${name.split(path.sep).join('/')}`);
-  const expected = [...distFiles, 'README.md', 'docs/capabilities.md', 'package.json'].sort();
+  const nativeFiles = existsSync(path.join(repoRoot, 'native', 'bin')) ? (await filesUnder(path.join(repoRoot, 'native', 'bin'))).map(name => `native/bin/${name.split(path.sep).join('/')}`) : [];
+  const expected = [...distFiles, ...nativeFiles, 'README.md', 'docs/capabilities.md', 'package.json'].sort();
   const packedFiles = record.files.map((entry) => entry.path).sort();
+  for (const retired of retiredRuntime) {
+    await assert.rejects(lstat(path.join(repoRoot, retired)), { code: 'ENOENT' }, `retired module must not remain in dist: ${retired}`);
+    assert.equal(packedFiles.includes(retired), false, `retired module must not be packed: ${retired}`);
+  }
   assert.deepEqual(packedFiles, expected, 'package contents must be an explicit runtime allowlist');
   const tarPaths = tarEntries(gunzipSync(await readFile(tgz)))
     .filter((name) => !name.endsWith('/'))
     .map((name) => name.startsWith('package/') ? name.slice('package/'.length) : name);
+  for (const retired of retiredRuntime) assert.equal(tarPaths.includes(retired), false, `retired module must not be in the tarball: ${retired}`);
   assert.deepEqual(tarPaths, expected, 'tarball entries must match npm pack manifest exactly');
   for (const entry of record.files) {
     assert.doesNotMatch(entry.path, /(?:^|[/\\])data(?:[/\\]|$)/iu);
@@ -204,6 +211,7 @@ test('packed release allowlist and isolated npm install lifecycle', async (t) =>
     assert.doesNotMatch(entry.path, /\.py(?:c)?$/iu);
     assert.doesNotMatch(entry.path, /(?:^|[/\\])(?:tests?|node_modules|src)(?:[/\\]|$)/iu);
     assert.doesNotMatch(entry.path, /(?:^|[/\\])\.claude(?:[/\\]|$)/iu);
+    assert.doesNotMatch(entry.path, /^native\/pam(?:\/|$)/iu, 'standalone unlocking must not ship a PAM policy');
   }
   assert.doesNotMatch(packedFiles.join('\n'), /data|id_ed25519|python|typescript/iu);
 
@@ -240,14 +248,13 @@ test('packed release allowlist and isolated npm install lifecycle', async (t) =>
   await assertStatus(help, 'installed autogit --help failed');
   assert.match(text(help), /不需要 Python/u);
   const configured = await runInstalledBin(f, bin, ['--app-dir', appRoot, '--path', f.path], Buffer.from('0\n'));
-  await assertStatus(configured, 'installed autogit menu failed');
-  assert.ok(text(configured).includes(`账号资料：${dataDir}`));
-  assert.match(text(configured), /已退出/u);
-  assert.match(text(configured), /新建公开\/私有仓库/u);
+  assert.equal(configured.status, 1, 'installed CLI must reject piped input without a secure secret terminal');
+  assert.match(text(configured), /交互式终端|安全终端/u);
+  assert.doesNotMatch(text(configured), /你想做什么/u);
   assert.match(await readFile(path.join(installedPackage, 'docs', 'capabilities.md'), 'utf8'), /未实现|部分|不支持|未验证/u);
   for (const [name, bytes] of dataBeforeInstall) assert.deepEqual(await readFile(path.join(appRoot, name)), bytes);
   const dataAfterFirstRun = await snapshot(appRoot);
-  assert.equal(JSON.parse(await readFile(path.join(dataDir, 'settings.json'), 'utf8')).last_project, f.path);
+  await assertSnapshotEqual(dataBeforeInstall, appRoot);
 
   const originalCli = await readFile(installedCli);
   await writeFile(installedCli, '#!/usr/bin/env node\nprocess.stdout.write("corrupt\\n");\n');
@@ -256,18 +263,13 @@ test('packed release allowlist and isolated npm install lifecycle', async (t) =>
   assert.deepEqual(await readFile(installedCli), originalCli, 'reinstall must replace the installed runtime');
   await assertSnapshotEqual(dataAfterFirstRun, appRoot);
   const upgradedRun = await runInstalledBin(f, bin, ['--app-dir', appRoot, '--path', f.path], Buffer.from('0\n'));
-  await assertStatus(upgradedRun, 'reinstalled autogit menu failed');
-  assert.ok(text(upgradedRun).includes(`账号资料：${dataDir}`));
+  assert.equal(upgradedRun.status, 1, 'reinstalled CLI must still require secure standalone password input');
+  assert.match(text(upgradedRun), /交互式终端|安全终端/u);
+  assert.doesNotMatch(text(upgradedRun), /你想做什么/u);
   const dataAfterUpgradeRun = await snapshot(appRoot);
   assert.deepEqual([...dataAfterUpgradeRun.keys()].sort(), [...dataAfterFirstRun.keys()].sort());
   for (const [name, bytes] of dataAfterFirstRun) {
-    if (name.split(path.sep).join('/') !== 'data/projects.json') assert.deepEqual(dataAfterUpgradeRun.get(name), bytes);
-    else {
-      const before = JSON.parse(bytes.toString('utf8')), after = JSON.parse(dataAfterUpgradeRun.get(name).toString('utf8'));
-      assert.equal(after.projects.length, before.projects.length);
-      after.projects.forEach((item, index) => { assert.ok(item.last_used >= before.projects[index].last_used); item.last_used = before.projects[index].last_used; });
-      assert.deepEqual(after, before, 'starting the app may update recency, not project ids, paths, labels or favorites');
-    }
+    assert.deepEqual(dataAfterUpgradeRun.get(name), bytes, 'locked startup must not update any account data');
   }
 
   const removed = await npm(f, ['uninstall', '--global', '--ignore-scripts', '--offline', '--prefix', f.prefix, packageName]);

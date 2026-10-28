@@ -1,5 +1,7 @@
-/** GitHub CLI boundary. AutoGit never reads gh's credential store or token output. */
+/** GitHub CLI boundary. Managed sessions use only explicitly enrolled Vault tokens. */
 import { resolve } from 'node:path';
+import { currentSession, requireSession, type CredentialSession } from './session.js';
+import { credentialsMenu, enrollToken, validateToken, sessionGhDirectory } from './credentials.js';
 import { GitError, validateUrl } from './git.js';
 import { runProcess, which, type ProcessResult } from './process.js';
 import { exactKeys, parseStrictJson, record } from './storage.js';
@@ -160,8 +162,10 @@ export class GithubClient {
   private readonly runner: typeof runProcess;
   private readonly findTool: typeof which;
   private readonly environment: NodeJS.ProcessEnv | undefined;
+  private managedSession: CredentialSession | undefined;
   readonly host: string;
-  readonly actor: string | undefined;
+  private selectedActor: string | undefined;
+  get actor(): string | undefined { return this.selectedActor; }
   readonly owner: string | undefined;
   constructor(cwd: string, options: GithubOptions = {}) {
     this.cwd = resolve(cwd);
@@ -170,13 +174,23 @@ export class GithubClient {
     // Do not snapshot process.env: credentials added after construction must still
     // be rejected, and the caller's environment is never mutated.
     this.environment = options.env;
+    this.managedSession = currentSession();
     this.host = validateHost(options.host ?? 'github.com');
     if (options.actor && options.actorLogin && !sameName(options.actor, options.actorLogin)) throw new GitError('选定 actor 不一致。');
-    this.actor = options.actor || options.actorLogin ? loginName(options.actor ?? options.actorLogin!) : undefined;
+    this.selectedActor = options.actor || options.actorLogin ? loginName(options.actor ?? options.actorLogin!) : undefined;
     this.owner = options.owner ? loginName(options.owner) : undefined;
   }
 
-  private prepare(interactive = false): { program: string; env: NodeJS.ProcessEnv } {
+  private session(): CredentialSession | undefined {
+    const active = currentSession();
+    if (this.managedSession) {
+      if (this.managedSession.closed || active !== this.managedSession) throw new GitError('GitHub 凭据会话已关闭或变化；请重新选择账号，不能回退外部 gh。');
+      return this.managedSession;
+    }
+    if (active) { if (active.closed) throw new GitError('GitHub 凭据会话已经关闭。'); this.managedSession = active; }
+    return active;
+  }
+  private prepareEnvironment(interactive = false): NodeJS.ProcessEnv {
     const source = this.environment ?? process.env;
     const normalize = (key: string): string => process.platform === 'win32' ? key.toUpperCase() : key;
     const keys = Object.keys(source);
@@ -195,27 +209,44 @@ export class GithubClient {
       GH_HOST: this.host, GH_PAGER: 'cat', GH_NO_UPDATE_NOTIFIER: '1', GH_NO_EXTENSION_UPDATE_NOTIFIER: '1',
       NO_COLOR: '1', CLICOLOR: '0',
     });
-    // On Windows inherited spelling variants must not override deterministic flags.
     for (const key of Object.keys(env)) if (['NO_COLOR', 'CLICOLOR'].includes(normalize(key)) && key !== normalize(key)) delete env[key];
-    if (!interactive) env.GH_PROMPT_DISABLED = '1';
+    if (!interactive) env.GH_PROMPT_DISABLED = '1'; return env;
+  }
+  private findGh(env: NodeJS.ProcessEnv): string {
     let program: string | undefined;
     try { program = this.findTool('gh', env, this.cwd); }
     catch { throw new GitError('无法在本地检查可选 GitHub CLI（gh）；未进行网络请求。'); }
     if (!program) throw new GitError('未找到可选 GitHub CLI（gh）；请访问 https://cli.github.com/ 获取 Windows 官方安装包或 Linux 官方发行版安装指引。不会自动安装；也可返回选择关联已有仓库。');
     if (process.platform === 'win32' && /\.(?:cmd|bat)$/iu.test(program)) throw new GitError('GitHub CLI（gh）必须是原生可执行程序，不能通过 shell 运行 .cmd/.bat。');
+    return program;
+  }
+  private async prepare(interactive = false): Promise<{ program: string; env: NodeJS.ProcessEnv }> {
+    const env = this.prepareEnvironment(interactive), program = this.findGh(env), session = this.session();
+    if (session) {
+      if (!this.actor) throw new GitError('托管 GitHub 请求必须先明确选择 actor。');
+      if (interactive) throw new GitError('托管会话不允许外部 gh 登录或切换账号。');
+      const token = await session.getToken(this.host, this.actor);
+      if (!token) throw new GitError(`尚未保存 ${this.host} / ${this.actor} 的 Token；请先进入“HTTPS / GitHub 凭据”录入。不会读取外部 gh 凭据，也不会回退外部凭据助手。`);
+      try { validateToken(token); env.GH_CONFIG_DIR = await sessionGhDirectory(session); if (session !== this.session()) throw new GitError('GitHub 凭据会话已经变化。'); const tokenKey = this.host === 'github.com' || this.host.endsWith('.ghe.com') ? 'GH_TOKEN' : 'GH_ENTERPRISE_TOKEN'; env[tokenKey] = token.toString('ascii'); }
+      finally { token.fill(0); }
+    }
     return { program, env };
   }
+  selectActor(value: string): void {
+    const selected = loginName(value); if (this.actor && !sameName(this.actor, selected)) throw new GitError('所选 GitHub actor 与客户端不一致。'); this.selectedActor = selected;
+  }
+  private clearToken(env: NodeJS.ProcessEnv): void { for (const name of CREDENTIAL_ENV) delete env[name]; }
 
-  /** Purely local: no subprocess, API, credential-store or auth-status reads. */
-  ensureAvailable(): void { this.prepare(); }
+  /** Purely local: no subprocess, credential-store or auth-status reads. */
+  ensureAvailable(): void { this.findGh(this.prepareEnvironment()); }
 
   private async command(args: readonly string[]): Promise<ProcessResult> {
-    const { program, env } = this.prepare();
+    const { program, env } = await this.prepare();
     try { return await this.runner(program, args, { cwd: this.cwd, env, interactive: false, check: false }); }
     catch (error) {
       if (error instanceof Cancelled) throw new Cancelled('GitHub CLI 操作已中断；已完成的外部步骤不会自动还原。');
       throw new GitError(`gh 未完成${launchDetail(error)}；原始输出已隐藏，请检查工具、认证或网络。`);
-    }
+    } finally { this.clearToken(env); }
   }
 
   /** All writes recheck the explicitly selected actor; never infer it from a token environment. */
@@ -233,20 +264,20 @@ export class GithubClient {
 
   private async apiResult(method: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE', endpoint: string, query?: string, body?: Record<string, unknown> | Buffer, headers: readonly string[] = []): Promise<ProcessResult> {
     const path = this.endpoint(endpoint), writing = method !== 'GET';
-    if (writing) await this.ensureActor();
+    if (writing || this.session()) await this.ensureActor();
     const args = ['api', '--hostname', this.host, '--method', method, path];
     if (query) args.push('--jq', query);
     else if (writing) args.push('--silent');
     for (const header of headers) args.push('--header', header);
     if (body !== undefined) args.push('--input', '-');
-    const { program, env } = this.prepare();
+    const { program, env } = await this.prepare();
     let result: ProcessResult;
     try { result = await this.runner(program, args, { cwd: this.cwd, env, check: false, interactive: false, ...(body === undefined ? {} : { inputData: Buffer.isBuffer(body) ? body : Buffer.from(JSON.stringify(body)) }) }); }
     catch (error) {
       const message = `GitHub 请求未完成${launchDetail(error)}${writing ? '；写入结果未知，请先只读检查目标，不会自动重试或回滚' : ''}。原始错误已隐藏。`;
       if (error instanceof Cancelled) throw new Cancelled(message);
       throw new GitError(message);
-    }
+    } finally { this.clearToken(env); }
     if (result.status !== 0 || result.signal) throw readFailure(result, writing);
     return result;
   }
@@ -275,14 +306,14 @@ export class GithubClient {
   async addSshKey(publicKey: string, title: string): Promise<void> {
     inputText(title); inputText(publicKey);
     await this.ensureActor();
-    const { program, env } = this.prepare();
+    const { program, env } = await this.prepare();
     let result: ProcessResult;
     try { result = await this.runner(program, ['ssh-key', 'add', '-', '--title', title, '--type', 'authentication'], { cwd: this.cwd, env, check: false, interactive: false, inputData: Buffer.from(`${publicKey}\n`) }); }
     catch (error) {
       const message = 'SSH 公钥添加结果未知；请先到选定 host 的账号 SSH keys 页面检查，不会自动重试或删除。原始错误已隐藏。';
       if (error instanceof Cancelled) throw new Cancelled(message);
       throw new GitError(message);
-    }
+    } finally { this.clearToken(env); }
     if (result.status !== 0 || result.signal) throw readFailure(result, true);
   }
   async uploadRelease(context: RepositoryContext, tag: string, files: readonly string[], options: { clobber?: boolean } = {}): Promise<void> {
@@ -291,14 +322,14 @@ export class GithubClient {
     if (!tag || tag.startsWith('-') || /[\s~^:?*\[\]\\]/u.test(tag) || tag.includes('..')) throw new GitError('Release Tag 无效。');
     if (options.clobber !== undefined && typeof options.clobber !== 'boolean') throw new GitError('必须明确选择是否覆盖附件。');
     await this.ensureActor();
-    const { program, env } = this.prepare();
+    const { program, env } = await this.prepare();
     let result: ProcessResult;
     try { result = await this.runner(program, ['release', 'upload', tag, '--repo', `${this.host}/${loginName(context.owner)}/${validateRepositoryName(context.name)}`, ...(options.clobber ? ['--clobber'] : []), '--', ...files], { cwd: this.cwd, env, interactive: false, check: false }); }
     catch (error) {
       const message = '发布附件上传结果未知；部分附件可能已上传，请先只读检查，不会自动重试、覆盖或回滚。';
       if (error instanceof Cancelled) throw new Cancelled(message);
       throw new GitError(message);
-    }
+    } finally { this.clearToken(env); }
     if (result.status !== 0 || result.signal) throw readFailure(result, true);
   }
 
@@ -309,12 +340,14 @@ export class GithubClient {
   }
 
   async switchAccount(login: string): Promise<void> {
+    if (this.session()) throw new GitError('托管会话不允许修改外部 gh 默认账号；请使用 AutoGit 的加密 Token。');
     const expected = loginName(login);
     const result = await this.command(['auth', 'switch', '--hostname', this.host, '--user', expected]);
     if (result.status !== 0) throw new GitError(`外部 gh 账号切换未完成（${statusDetail(result)}）；不会自动恢复或重试。原始输出已隐藏。`);
   }
 
   async browserLogin(ui: Console): Promise<boolean> {
+    if (this.session()) throw new GitError('托管会话不允许外部 gh 登录；请使用 AutoGit 的加密 Token。');
     this.ensureAvailable();
     ui.text('gh 使用自己的外部网络传输与凭据存储，与 AutoGit 托管的 SSH 密钥分开；可能改变外部 gh/Git 配置与默认账号，不会自动恢复。');
     ui.text('登录由原生 gh 与浏览器处理；安全凭据存储不可用时，gh 可能回退到明文存储令牌。AutoGit 不接收、读取或保存令牌，也不会上传 SSH 密钥。');
@@ -322,7 +355,7 @@ export class GithubClient {
       ui.text('gh 浏览器登录需要真实交互终端；请不要通过管道提供凭据。未启动登录。');
       return false;
     }
-    const { program, env } = this.prepare(true);
+    const { program, env } = await this.prepare(true);
     let result: ProcessResult;
     try {
       result = await this.runner(program, ['auth', 'login', '--hostname', this.host, '--git-protocol', 'ssh', '--skip-ssh-key', '--web'], { cwd: this.cwd, env, interactive: true, check: false });
@@ -330,7 +363,7 @@ export class GithubClient {
       if (error instanceof Cancelled) throw new Cancelled('外部 gh 登录已中断；外部凭据或默认账号可能已改变，不会自动恢复。');
       ui.text(`gh 浏览器登录未完成${launchDetail(error)}；外部状态可能已改变，原始错误已隐藏。`);
       return false;
-    }
+    } finally { this.clearToken(env); }
     ui.text(`外部 gh 登录流程结束（${statusDetail(result)}）；不会据此认定账号匹配，仍需重新联网核对登录名。`);
     return result.status === 0;
   }
@@ -339,13 +372,14 @@ export class GithubClient {
     const expected = loginName(owner), repository = validateRepositoryName(name);
     if (visibility !== 'private' && visibility !== 'public') throw new GitError('仓库可见性必须明确选择 private 或 public。');
     const host = validateHost(options.host ?? this.host), actor = loginName(options.actor ?? options.actorLogin ?? this.actor ?? expected);
+    if (this.session()) this.selectActor(actor);
     if (host !== this.host) throw new GitError('建库 host 与客户端上下文不一致；请为该 host 创建独立客户端。');
     if (this.actor && !sameName(actor, this.actor) || options.actor && options.actorLogin && !sameName(options.actor, options.actorLogin)) throw new GitError('建库 actor 与选定客户端不一致。');
     const selectedOwner = loginName(options.owner ?? this.owner ?? expected);
     const url = repositoryUrl(expected, repository, host);
     if (!sameName(await this.currentLogin(), actor)) throw new GitError('当前 gh 账号已与选定 actor 不一致，未创建仓库；请返回重新明确认证。');
     if (!sameName(selectedOwner, expected)) throw new GitError('仓库 owner 与选定上下文不一致。');
-    const { program, env } = this.prepare();
+    const { program, env } = await this.prepare();
     let result: ProcessResult;
     const createArgs = ['repo', 'create', `${expected}/${repository}`, `--${visibility}`];
     try {
@@ -354,7 +388,7 @@ export class GithubClient {
       const message = `GitHub 创建结果未知，仓库可能已创建${error instanceof Cancelled ? '（操作已中断）' : launchDetail(error)}。${recovery(url)}`;
       if (error instanceof Cancelled) throw new Cancelled(message);
       throw new GitError(message);
-    }
+    } finally { this.clearToken(env); }
     if (result.status !== 0) throw new GitError(creationFailure(result, url));
     // Synchronous notification must precede verification so callers retain the
     // irreversible creation state even if the next API call is interrupted.
@@ -378,6 +412,22 @@ export class GithubClient {
 export async function authenticateGithub(ui: Console, client: GithubClient, expected: string): Promise<string | undefined> {
   const selected = loginName(expected);
   client.ensureAvailable();
+  const session = currentSession();
+  if (session) {
+    client.selectActor(selected);
+    for (;;) {
+      const existing = await session.getToken(client.host, selected);
+      if (!existing) await credentialsMenu(ui, '', { host: client.host, account: selected });
+      else existing.fill(0);
+      try {
+        const actual = await client.currentLogin();
+        if (sameName(actual, selected)) return actual;
+        ui.text('Token 对应的 actor 与选定账号不一致；未改变账号或绑定。');
+      } catch (error) { if (error instanceof Cancelled) throw error; ui.text('托管 Token 的只读账号核验未通过；可能令牌过期、host 不匹配或网络不可用。不会读取外部 gh 凭据。'); }
+      if (!await ui.menu('托管 GitHub 凭据', ['重新录入选定 host / actor 的 Token'])) return undefined;
+      await enrollToken(ui, client.host, selected);
+    }
+  }
   ui.text(`选定 AutoGit 账号的预期 GitHub 登录名：${selected}。gh 默认账号是独立的，不会据此更改 AutoGit 账号或项目绑定。`);
   let checkLogin = true;
   for (;;) {

@@ -2,9 +2,14 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import * as fs from 'node:fs/promises';
 import { existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
-import { createBackup, validateBackup, restoreBackup, relocateData, remapDataPaths } from '../dist/backup.js';
+import { createBackup, validateBackup, restoreBackup, relocateData, remapDataPaths, backupMenu } from '../dist/backup.js';
 import { appDataDir, configureApp, resetAppContextForTests } from '../dist/app-context.js';
+import { Vault, VaultUnlockError } from '../dist/vault.js';
+import { Cancelled } from '../dist/ui.js';
+import { CredentialSession, currentSession, setSession } from '../dist/session.js';
+import { managedKeyMarker } from '../dist/managed-keys.js';
 import { savePreferences } from '../dist/preferences.js';
 import { Profile, ProfileStore } from '../dist/profiles.js';
 import { GitError } from '../dist/git.js';
@@ -77,4 +82,133 @@ test('relocation updates only the configured pointer after verified copy, never 
 test('restore explicitly clears old custom SSH executable paths without changing portable profile schema2', async t => {
   const f = await fixture(t); const profile = await fixtureData(f); const metadata = join(appDataDir(), 'profiles', profile.profile_id, 'profile.json'); const encoded = JSON.parse(await fs.readFile(metadata)); encoded.ssh_program = '/missing/previous-computer/ssh'; await fs.writeFile(metadata, JSON.stringify(encoded));
   const backup = join(f.base, 'backup'); await createBackup(backup); const data = join(f.base, 'restored-data'); await restoreBackup(backup, data, { sshProgram: 'system' }); const restored = JSON.parse(await fs.readFile(join(data, 'profiles', profile.profile_id, 'profile.json'))); assert.equal(restored.schema_version, 2); assert.equal(restored.ssh_program, ''); assert.equal(restored.private_key, `profiles/${profile.profile_id}/id_ed25519`);
+});
+
+function passwordUi({ secrets = ['fixture-password'], answers = [], onSecret } = {}) {
+  const entered = secrets.map((value) => Buffer.from(value)), pending = [...entered];
+  let calls = 0;
+  const ui = new ScriptedConsole(answers, { secretInput: async () => {
+    calls++; assert.ok(pending.length, 'unexpected secret input request');
+    const value = pending.shift(); await onSecret?.(value); return value;
+  } });
+  Object.defineProperty(ui, 'secretCalls', { get: () => calls });
+  ui.entered = entered;
+  return ui;
+}
+function realUnlockFailures(t) {
+  const failures = [], original = Vault.unlock;
+  t.mock.method(Vault, 'unlock', async function(...args) {
+    try { return await original.apply(this, args); }
+    catch (error) { failures.push(error); throw error; }
+  });
+  return failures;
+}
+async function currentVaultSession(t, f, withLegacyProfile = false) {
+  setSession(undefined);
+  if (withLegacyProfile) await fixtureData(f);
+  const password = Buffer.from('fixture-password');
+  const created = await Vault.create(appDataDir(), password); password.fill(0);
+  const session = new CredentialSession(created.vault);
+  setSession(session);
+  t.after(async () => { await currentSession()?.close(); setSession(undefined); });
+  return session;
+}
+
+test('restore decrypts staging with its standalone password before replacement and activates without a second password', async t => {
+  const f = await fixture(t); const session = await currentVaultSession(t, f);
+  const backup = join(f.base, 'encrypted-backup'); await createBackup(backup);
+  const target = join(f.base, 'restored-root', 'data'); const ui = passwordUi();
+  const result = await restoreBackup(backup, target, { replace: false, ui, activate: true });
+  assert.equal(ui.secretCalls, 1); assert.ok(ui.entered.every(value => value.every(byte => byte === 0)));
+  assert.equal(result.activated.dataDir, target); assert.equal(currentSession()?.vault.directory, target); assert.notEqual(currentSession(), session); assert.equal(session.closed, true); assert.equal(await fs.readFile(join(target, 'vault.json')).then(() => true), true);
+});
+
+test('three real staging password failures followed by exit never replace target or close the protected session', async t => {
+  const f = await fixture(t); const session = await currentVaultSession(t, f);
+  const backup = join(f.base, 'encrypted-backup'); await createBackup(backup);
+  const before = await fs.readFile(join(backup, 'files', 'vault.json'));
+  const target = join(f.base, 'existing-root', 'data'); await fs.mkdir(target, { recursive: true }); await fs.writeFile(join(target, 'keep.txt'), 'fixture-old-target');
+  const ui = passwordUi({ secrets: Array(3).fill('wrong-fixture-password'), answers: ['1', '1', '0'] }), failures = realUnlockFailures(t);
+  await assert.rejects(restoreBackup(backup, target, { replace: true, ui, activate: true }), Cancelled);
+  assert.equal(failures.length, 3); assert.ok(failures.every(error => error instanceof VaultUnlockError));
+  assert.equal(ui.secretCalls, 3); assert.deepEqual(ui.answers, []); assert.ok(ui.entered.every(value => value.every(byte => byte === 0)));
+  assert.deepEqual(await fs.readFile(join(backup, 'files', 'vault.json')), before);
+  assert.equal(await fs.readFile(join(target, 'keep.txt'), 'utf8'), 'fixture-old-target'); assert.deepEqual(await fs.readdir(target), ['keep.txt']); assert.equal(currentSession(), session); assert.equal(session.closed, false);
+});
+
+test('cryptographic staging validation rejects tampered ciphertext even when backup SHA-256 is consistent', async t => {
+  const f = await fixture(t); const session = await currentVaultSession(t, f); const secret = Buffer.from('fixture-encrypted-value'); await session.vault.put('fixture:record', secret); secret.fill(0);
+  const backup = join(f.base, 'tampered-backup'); await createBackup(backup);
+  const vaultFile = join(backup, 'files', 'vault.json'); const vaultDocument = JSON.parse(await fs.readFile(vaultFile)); const tag = Buffer.from(vaultDocument.records[0].tag, 'base64'); tag[0] ^= 1; vaultDocument.records[0].tag = tag.toString('base64'); const bytes = Buffer.from(JSON.stringify(vaultDocument)); await fs.writeFile(vaultFile, bytes);
+  const manifestFile = join(backup, 'manifest.json'); const manifest = JSON.parse(await fs.readFile(manifestFile)); const entry = manifest.files.find(item => item.path === 'vault.json'); entry.size = bytes.length; entry.sha256 = createHash('sha256').update(bytes).digest('hex'); await fs.writeFile(manifestFile, JSON.stringify(manifest));
+  const target = join(f.base, 'unchanged-target', 'data'); await fs.mkdir(target, { recursive: true }); await fs.writeFile(join(target, 'keep.txt'), 'fixture-before');
+  await assert.rejects(restoreBackup(backup, target, { replace: true, ui: passwordUi(), activate: true }), /完整性/u);
+  assert.equal(await fs.readFile(join(target, 'keep.txt'), 'utf8'), 'fixture-before'); assert.deepEqual(await fs.readdir(target), ['keep.txt']); assert.equal(currentSession(), session); assert.equal(session.closed, false);
+  const stillReadable = await session.vault.get('fixture:record'); assert.equal(stillReadable.toString(), 'fixture-encrypted-value'); stillReadable.fill(0);
+});
+
+test('a managed-key marker without a decryptable vault record cannot replace a restore target', async t => {
+  const f = await fixture(t); setSession(undefined); const profile = await fixtureData(f); await fs.writeFile(profile.private_key, managedKeyMarker(profile.profile_id));
+  const password = Buffer.from('fixture-password'); const created = await Vault.create(appDataDir(), password); password.fill(0); const session = new CredentialSession(created.vault); setSession(session); t.after(async () => { await currentSession()?.close(); setSession(undefined); });
+  const backup = join(f.base, 'missing-record-backup'); await createBackup(backup); const target = join(f.base, 'missing-record-target', 'data'); await fs.mkdir(target, { recursive: true }); await fs.writeFile(join(target, 'keep.txt'), 'fixture-before');
+  await assert.rejects(restoreBackup(backup, target, { replace: true, ui: passwordUi(), activate: true }), /可解密凭据/u);
+  assert.equal(await fs.readFile(join(target, 'keep.txt'), 'utf8'), 'fixture-before'); assert.equal(currentSession(), session); assert.equal(session.closed, false);
+});
+
+test('restore without an interactive verifier accepts only a verified copy of the currently unlocked vault', async t => {
+  const f = await fixture(t); const original = await currentVaultSession(t, f); const backup = join(f.base, 'same-copy-backup'); await createBackup(backup); const first = join(f.base, 'same-copy'); await restoreBackup(backup, first); assert.equal(currentSession(), original);
+  const password = Buffer.from('fixture-password'); const directory = join(f.base, 'different-current', 'data'); const created = await Vault.create(directory, password); password.fill(0); const other = new CredentialSession(created.vault); setSession(other); await original.close(); await configureApp(new ScriptedConsole([]), { dataDir: directory });
+  const target = join(f.base, 'different-target', 'data'); await fs.mkdir(target, { recursive: true }); await fs.writeFile(join(target, 'keep.txt'), 'fixture-before');
+  await assert.rejects(restoreBackup(backup, target, { replace: true }), /不是当前已解锁/u);
+  assert.equal(await fs.readFile(join(target, 'keep.txt'), 'utf8'), 'fixture-before'); assert.equal(currentSession(), other); assert.equal(other.closed, false);
+});
+
+test('a location commit failure rolls installed restore data back and never drops the old protected session', async t => {
+  const f = await fixture(t); delete process.env.AUTOGIT_DATA_DIR; resetAppContextForTests(); const first = join(f.base, 'pointer-source'); await configureApp(new ScriptedConsole([first])); const session = await currentVaultSession(t, f); const backup = join(f.base, 'pointer-backup'); await createBackup(backup);
+  const pointer = process.platform === 'win32' ? join(process.env.APPDATA, 'AutoGit', 'location.json') : join(process.env.XDG_CONFIG_HOME, 'autogit', 'location.json'); const target = join(f.base, 'pointer-target', 'data'); await fs.mkdir(target, { recursive: true }); await fs.writeFile(join(target, 'keep.txt'), 'fixture-before');
+  const ui = passwordUi({ onSecret: async () => { await fs.writeFile(pointer, 'fixture-broken-pointer'); } });
+  await assert.rejects(restoreBackup(backup, target, { replace: true, ui, activate: true }), /损坏/u);
+  assert.equal(await fs.readFile(join(target, 'keep.txt'), 'utf8'), 'fixture-before'); assert.deepEqual(await fs.readdir(target), ['keep.txt']); assert.equal(appDataDir(), join(first, 'data')); assert.equal(currentSession(), session); assert.equal(session.closed, false); assert.equal(await fs.readFile(pointer, 'utf8'), 'fixture-broken-pointer');
+});
+
+test('a separately encrypted restored vault uses its own distinct staging password and activates with one prompt', async t => {
+  const f = await fixture(t); const original = await currentVaultSession(t, f); const source = join(f.base, 'foreign-source', 'data'); const password = Buffer.from('independent-restore-password'); const foreign = await Vault.create(source, password); password.fill(0); const record = Buffer.from('fixture-foreign-record'); await foreign.vault.put('fixture:foreign', record); record.fill(0); foreign.vault.close(); const backup = join(f.base, 'foreign-backup'); await createBackup(backup, source);
+  const target = join(f.base, 'foreign-target', 'data'); const ui = passwordUi({ secrets: ['independent-restore-password'] }); const result = await restoreBackup(backup, target, { ui, activate: true });
+  assert.equal(ui.secretCalls, 1); assert.ok(ui.entered.every(value => value.every(byte => byte === 0))); assert.equal(result.activated.dataDir, target); assert.equal(original.closed, true); assert.equal(currentSession().vault.directory, target); const value = await currentSession().vault.get('fixture:foreign'); assert.equal(value.toString(), 'fixture-foreign-record'); value.fill(0);
+});
+
+test('encrypted backup with no live session requires UI verification and rejects three real wrong passwords before installation', async t => {
+  const f = await fixture(t), original = await currentVaultSession(t, f);
+  await original.vault.put('fixture:restored', Buffer.from('synthetic-restored-value'));
+  const backup = join(f.base, 'no-active-backup'); await createBackup(backup); await original.close();
+  const target = join(f.base, 'no-active-target', 'data'); await fs.mkdir(target, { recursive: true }); await fs.writeFile(join(target, 'keep.txt'), 'preserve-before-unlock');
+  const failures = realUnlockFailures(t), denied = passwordUi({ secrets: Array(3).fill('wrong-fixture-password'), answers: ['1', '1', '0'] });
+  await assert.rejects(restoreBackup(backup, target, { replace: true, ui: denied, activate: true }), Cancelled);
+  assert.equal(failures.length, 3); assert.ok(failures.every(error => error instanceof VaultUnlockError)); assert.equal(currentSession(), undefined);
+  assert.deepEqual(await fs.readdir(target), ['keep.txt']); assert.equal(await fs.readFile(join(target, 'keep.txt'), 'utf8'), 'preserve-before-unlock');
+  const accepted = passwordUi(); await restoreBackup(backup, target, { replace: true, ui: accepted, activate: true });
+  assert.equal(accepted.secretCalls, 1); assert.equal(currentSession().vault.directory, target);
+  const value = await currentSession().vault.get('fixture:restored'); try { assert.equal(value.toString(), 'synthetic-restored-value'); } finally { value.fill(0); }
+});
+
+test('an independent encrypted backup cannot be installed without UI or a matching live DEK', async t => {
+  const f = await fixture(t), session = await currentVaultSession(t, f);
+  const backup = join(f.base, 'locked-backup'); await createBackup(backup); await session.close();
+  const target = join(f.base, 'locked-target', 'data'); await fs.mkdir(target, { recursive: true }); await fs.writeFile(join(target, 'keep.txt'), 'locked-target-unchanged');
+  await assert.rejects(restoreBackup(backup, target, { replace: true }), /解锁|验证|凭据会话/u);
+  assert.equal(currentSession(), undefined); assert.deepEqual(await fs.readdir(target), ['keep.txt']); assert.equal(await fs.readFile(join(target, 'keep.txt'), 'utf8'), 'locked-target-unchanged');
+});
+
+test('backup menu refuses to continue as a legacy menu if its protected session closes', async t => {
+  const f = await fixture(t); const session = await currentVaultSession(t, f); let prompts = 0;
+  await assert.rejects(backupMenu({ async menu() { prompts++; await session.close(); return 0; } }), /凭据会话已锁定/u);
+  assert.equal(prompts, 1); assert.equal(currentSession(), undefined);
+});
+
+test('staging migration cancellation never replaces target or enables an unprotected legacy copy', async t => {
+  const f = await fixture(t); setSession(undefined); await fixtureData(f); const password = Buffer.from('fixture-password'); const created = await Vault.create(appDataDir(), password); password.fill(0);
+  const backup = join(f.base, 'legacy-encrypted-backup'); await createBackup(backup); const session = new CredentialSession(created.vault); setSession(session); t.after(async () => { await currentSession()?.close(); setSession(undefined); });
+  const target = join(f.base, 'legacy-target', 'data'); await fs.mkdir(target, { recursive: true }); await fs.writeFile(join(target, 'keep.txt'), 'fixture-old-target'); const ui = passwordUi({ answers: ['n'] });
+  await assert.rejects(restoreBackup(backup, target, { replace: true, ui, activate: true }), /未迁移旧私钥/u);
+  assert.equal(ui.secretCalls, 1); assert.equal(await fs.readFile(join(target, 'keep.txt'), 'utf8'), 'fixture-old-target'); assert.equal(currentSession(), session); assert.equal(session.closed, false);
 });

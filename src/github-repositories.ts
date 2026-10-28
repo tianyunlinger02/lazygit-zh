@@ -163,13 +163,16 @@ export async function githubAction(ui: Console, action: () => Promise<void>): Pr
   }
 }
 
-/** An ephemeral remote makes Git resolve pushInsteadOf/pushurl exactly as push will, without persisting config. */
+/** Pin both directions without persisting a remote; an explicit pushurl excludes pushInsteadOf. */
 export async function explicitGitTransport(repo: Git, address: string, push = false): Promise<{ git: Git; remote: string }> {
   const remote = `autogit-explicit-${randomBytes(12).toString('hex')}`;
   if ((await repo.remotes()).includes(remote)) throw new GitError('一次性远程名冲突；请重新选择。');
-  const git = repo.configured({ [`remote.${remote}.url`]: address });
-  const urls = await git.remoteUrls(remote, push);
-  if (urls.length !== 1 || urls[0].toLowerCase() !== address.toLowerCase()) throw new GitError('Git URL 重写 / pushurl 改变了明确选择的目标；已停止，不会传输。');
+  const git = repo.configured({ [`remote.${remote}.url`]: address, ...(push ? { [`remote.${remote}.pushurl`]: address } : {}) });
+  // Git 2.34 recognizes command-scoped remotes for transport, but its remote
+  // get-url rejects them. ls-remote --get-url resolves insteadOf offline;
+  // the explicit pushurl separately excludes pushInsteadOf.
+  const effective = await git.value('ls-remote', '--get-url', address);
+  if (effective.toLowerCase() !== address.toLowerCase()) throw new GitError('Git URL 重写改变了明确选择的目标；已停止，不会传输。');
   return { git, remote };
 }
 export async function cloneRepository(ui: Console, session: GithubSession, context: RepositoryContext): Promise<string | undefined> {
@@ -177,10 +180,10 @@ export async function cloneRepository(ui: Console, session: GithubSession, conte
   const parent = checkedPath(path.resolve(session.directory, await ui.ask('下载父目录', session.directory)), 'dir');
   const target = await chooseCloneTarget(ui, parent, context.name);
   const transport = githubTransport(session, context), address = transportUrl(`${context.owner}/${context.name}`, transport);
-  let git = await profileGit(parent, session.profile, transport);
+  let git = await profileGit(parent, session.profile, transport, address);
   if ((await git.value('ls-remote', '--get-url', address)).toLowerCase() !== address.toLowerCase()) throw new GitError('Git URL 重写改变了选定仓库目标，拒绝下载。');
   if (!await confirmGithubRoutine(ui, session, context, '按明确传输模式下载仓库', `来源：${address}\n传输：${transportSummary(transport)}\n新目录：${target.directory}\n成功后先保存该主机/传输配置，再绑定选定 AutoGit 账号；绑定仅决定 AutoGit 提交署名及托管模式身份。不会改写 clone 生成的 origin，不执行项目脚本。`)) return undefined;
-  git = await profileGit(parent, session.profile, transport);
+  git = await profileGit(parent, session.profile, transport, address);
   if ((await git.value('ls-remote', '--get-url', address)).toLowerCase() !== address.toLowerCase()) throw new GitError('确认期间 Git 下载目标发生变化，已停止。');
   await verifyCloneTarget(target);
   await git.run(['clone', '--', address, target.directory], { interactive: true });

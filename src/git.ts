@@ -16,7 +16,7 @@ export function explain(text: string): string {
     [['could not resolve', 'connection timed out', 'network is unreachable'], '网络或域名连接失败，请检查网络。'],
     [['host key verification failed', 'remote host identification has changed'], 'SSH 主机验证失败，请核对官方指纹，不要关闭验证。'],
     [['repository not found'], '仓库不存在或没有访问权限，请核对地址与账号。'],
-    [['not possible to fast-forward', 'divergent'], '历史已经分叉，不能快进；请在分支与合并中明确选择合并来源。'],
+    [['not possible to fast-forward', 'divergent'], '历史已经分叉，不能快进；请使用外部 Git 处理本地历史后重试，强推不能解决本地分叉。'],
   ] as [string[], string][]) if (patterns.some((pattern) => lower.includes(pattern))) return message;
   return 'Git 操作未完成；没有自动强推、重置或清理。';
 }
@@ -99,11 +99,12 @@ export function parseStatus(raw: Buffer): Change[] {
   }
   return changes;
 }
-export interface GitOptions { config?: Record<string, string>; env?: Record<string, string | undefined | null>; rejectEnv?: readonly string[] }
+export type GitConfigEntry = readonly [key: string, value: string];
+export interface GitOptions { config?: Record<string, string>; orderedConfig?: readonly GitConfigEntry[]; env?: Record<string, string | undefined | null>; rejectEnv?: readonly string[] }
 export interface GitRunOptions { check?: boolean; interactive?: boolean; captureStdout?: boolean; inputData?: Buffer }
 export class Git {
-  readonly directory: string; readonly overrides: Record<string, string>; readonly environment: Record<string, string | undefined | null>; readonly rejectedEnvironment: readonly string[];
-  constructor(directory: string, options: GitOptions = {}) { if (/[\udc80-\udcff]/u.test(directory)) throw new GitError('项目目录包含不能无损传递的字节路径，已停止。'); const path = resolve(directory); this.directory = existsSync(path) ? realpathSync(path) : path; this.overrides = { ...options.config }; this.environment = { ...options.env }; this.rejectedEnvironment = [...options.rejectEnv ?? []]; }
+  readonly directory: string; readonly overrides: Record<string, string>; readonly orderedConfig: readonly GitConfigEntry[]; readonly environment: Record<string, string | undefined | null>; readonly rejectedEnvironment: readonly string[];
+  constructor(directory: string, options: GitOptions = {}) { if (/[\udc80-\udcff]/u.test(directory)) throw new GitError('项目目录包含不能无损传递的字节路径，已停止。'); const path = resolve(directory); this.directory = existsSync(path) ? realpathSync(path) : path; this.overrides = { ...options.config }; this.orderedConfig = (options.orderedConfig ?? []).map(([key, value]) => [key, value] as const); this.environment = { ...options.env }; this.rejectedEnvironment = [...options.rejectEnv ?? []]; }
   async run(args: readonly string[], options: GitRunOptions = {}): Promise<ProcessResult> {
     if (!which('git', process.env, this.directory)) throw new GitError('未找到 Git，请安装 Git for Windows 或发行版的 Git。');
     const env = { ...process.env }; const blocked: string[] = [];
@@ -118,7 +119,7 @@ export class Git {
     }
     env.GIT_LITERAL_PATHSPECS = '1';
     if (args.some((arg) => /[\udc80-\udcff]/u.test(arg)) || /[\udc80-\udcff]/u.test(this.directory)) throw new GitError('此命令参数无法无损传递特殊字节路径；已停止，未替换文件名。');
-    const command = ['--no-pager', '-c', 'submodule.recurse=false', ...Object.entries(this.overrides).flatMap(([key, value]) => ['-c', `${key}=${value}`]), ...args];
+    const command = ['--no-pager', '-c', 'submodule.recurse=false', ...[...Object.entries(this.overrides), ...this.orderedConfig].flatMap(([key, value]) => ['-c', `${key}=${value}`]), ...args];
     let result: ProcessResult;
     try { result = await runProcess('git', command, { cwd: this.directory, env, interactive: options.interactive, captureStdout: options.captureStdout, inputData: options.inputData }); }
     catch (error) { if (error instanceof Cancelled) throw error; throw new GitError(`无法启动 Git：${redact(String(error))}`); }
@@ -129,21 +130,24 @@ export class Git {
   async value(...args: string[]): Promise<string> { return decodePath((await this.run(args)).stdout).trim(); }
   async config(key: string): Promise<string> { const result = await this.run(['config', '--get', key], { check: false }); return result.status === 0 ? decodePath(result.stdout).trim() : ''; }
   async root(): Promise<string> { const result = await this.run(['rev-parse', '--show-toplevel'], { check: false }); if (result.status) throw new GitError('当前目录还不是普通 Git 工作区。请选项目或使用“上传本地项目”初始化。'); return decodePath(result.stdout.subarray(0, result.stdout.length - (process.platform === 'win32' && result.stdout.at(-2) === 13 ? 2 : result.stdout.at(-1) === 10 ? 1 : 0))); }
-  async repository(): Promise<Git> { return new Git(await this.root(), { config: this.overrides, env: this.environment, rejectEnv: this.rejectedEnvironment }); }
-  configured(config: Record<string, string>): Git { return new Git(this.directory, { config: { ...this.overrides, ...config }, env: this.environment, rejectEnv: this.rejectedEnvironment }); }
+  async repository(): Promise<Git> { return new Git(await this.root(), { config: this.overrides, orderedConfig: this.orderedConfig, env: this.environment, rejectEnv: this.rejectedEnvironment }); }
+  configured(config: Record<string, string>): Git { return new Git(this.directory, { config: { ...this.overrides, ...config }, orderedConfig: this.orderedConfig, env: this.environment, rejectEnv: this.rejectedEnvironment }); }
+  configuredOrdered(config: readonly GitConfigEntry[], options: Pick<GitOptions, 'env' | 'rejectEnv'> = {}): Git {
+    return new Git(this.directory, { config: this.overrides, orderedConfig: [...this.orderedConfig, ...config], env: { ...this.environment, ...options.env }, rejectEnv: [...this.rejectedEnvironment, ...options.rejectEnv ?? []] });
+  }
   async gitPath(marker: string): Promise<string> { const path = await this.value('rev-parse', '--git-path', marker); if (/[\udc80-\udcff]/u.test(path)) throw new GitError('Git 元数据目录包含不能无损访问的字节路径，已停止。'); return isAbsolute(path) ? path : join(this.directory, path); }
   async operation(): Promise<string> { for (const marker of ['rebase-merge', 'rebase-apply', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'sequencer', 'BISECT_LOG', 'MERGE_AUTOSTASH', 'MERGE_HEAD']) if (existsSync(await this.gitPath(marker))) return marker; return ''; }
   async unmerged(): Promise<string[]> { return [...new Set(splitNul((await this.run(['ls-files', '-u', '-z'])).stdout).filter((entry) => entry.length).map((entry) => decodePath(entry.subarray(entry.indexOf(9) + 1))))]; }
   async ensureSupported(): Promise<void> {
-    // Ordinary operations update gitlink entries, not nested worktrees. Recursion is a separate task.
+    // Ordinary operations update gitlink entries, not nested worktrees; recursion is not provided here.
     await this.run(['ls-files', '--stage', '-z']);
   }
   async stagePaths(paths: readonly string[]): Promise<void> { if (paths.length) await this.run(['add', '--pathspec-from-file=-', '--pathspec-file-nul'], { inputData: Buffer.concat([...new Set(paths)].flatMap((path) => [encodePath(path), Buffer.from([0])])) }); }
   async changes(): Promise<Change[]> { return parseStatus((await this.run(['status', '--porcelain=v1', '-z', '--untracked-files=all'])).stdout); }
-  async branch(): Promise<string> { const result = await this.run(['symbolic-ref', '--quiet', '--short', 'HEAD'], { check: false }); if (result.status) throw new GitError('当前处于游离 HEAD，请先明确切换到分支。'); return decodePath(result.stdout).trim(); }
+  async branch(): Promise<string> { const result = await this.run(['symbolic-ref', '--quiet', '--short', 'HEAD'], { check: false }); if (result.status) throw new GitError('当前处于游离 HEAD；只读查看仍可使用，保存或传输前请使用外部 Git 切换到分支。'); return decodePath(result.stdout).trim(); }
   async hasCommits(): Promise<boolean> { return (await this.run(['rev-parse', '--verify', 'HEAD'], { check: false })).status === 0; }
   async remotes(): Promise<string[]> { const value = await this.value('remote'); return value ? value.split('\n') : []; }
   async remoteUrls(name: string, push = false): Promise<string[]> { const value = await this.value('remote', 'get-url', '--all', ...push ? ['--push'] : [], name); return value ? value.split('\n') : []; }
-  async ensureReady(): Promise<void> { if (await this.operation()) throw new GitError('仓库有尚未完成的合并、变基或其他操作，请进入“分支与合并”。'); await this.branch(); if ((await this.changes()).some((change) => change.conflict)) throw new GitError('工作区存在冲突，请进入冲突中心。'); await this.ensureSupported(); }
+  async ensureReady(): Promise<void> { if (await this.operation()) throw new GitError('仓库有尚未完成的合并、变基或其他操作；请使用外部 Git 处理或完成该操作后重试。'); await this.branch(); if ((await this.changes()).some((change) => change.conflict)) throw new GitError('工作区存在冲突；请使用外部 Git 解决冲突后重试。'); await this.ensureSupported(); }
   async ensureIdentity(): Promise<void> { if (!await this.config('user.name') || !await this.config('user.email')) throw new GitError('缺少提交姓名或邮箱，请在软件中选择账号。'); }
 }

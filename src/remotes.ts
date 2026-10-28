@@ -14,8 +14,40 @@ import {
   type RemoteTarget,
 } from './workflows.js';
 
-async function repository(directory: string): Promise<Git> {
-  return (await projectGit(directory)).repository();
+type Directory = string | Git;
+type Head = readonly [branch: string, oid: string];
+interface CachedRemoteRef { readonly ref: string; readonly name: string; readonly oid: string; readonly subject: string }
+
+async function repository(directory: Directory): Promise<Git> {
+  return (directory instanceof Git ? directory : await projectGit(directory)).repository();
+}
+
+async function head(repo: Git): Promise<Head> {
+  const result = await repo.run(['rev-parse', '--verify', 'HEAD'], { check: false });
+  return [await repo.branch(), result.status === 0 ? result.stdout.toString('ascii').trim() : ''];
+}
+
+async function verifyHead(repo: Git, snapshot: Head, source?: CachedRemoteRef): Promise<void> {
+  await repo.ensureReady();
+  const current = await head(repo);
+  if (current[0] !== snapshot[0] || current[1] !== snapshot[1]) throw new GitError('确认期间 HEAD 发生变化，请重新预览。');
+  if (source) {
+    const result = await repo.run(['rev-parse', '--verify', source.ref], { check: false });
+    if (result.status || result.stdout.toString('ascii').trim() !== source.oid) throw new GitError('上游目标分支在确认期间发生变化，请重新预览。');
+  }
+}
+
+async function cachedRemoteRefs(repo: Git): Promise<CachedRemoteRef[]> {
+  const result = await repo.run(['for-each-ref', '--format=%(refname)%00%(objectname)%00%(subject)%00%(symref)%00', 'refs/remotes/']);
+  const refs: CachedRemoteRef[] = [];
+  for (const record of decodePath(result.stdout).split('\0\n')) {
+    if (!record) continue;
+    const fields = record.split('\0');
+    if (fields.length !== 4 || !fields[0].startsWith('refs/remotes/')) throw new GitError('无法识别 Git 远程缓存列表，已停止操作。');
+    const [ref, oid, subject, symref] = fields;
+    if (!symref) refs.push({ ref, name: ref.slice('refs/remotes/'.length), oid, subject });
+  }
+  return refs;
 }
 
 async function chooseRemote(ui: Console, repo: Git): Promise<string | undefined> {
@@ -33,6 +65,39 @@ async function chooseRemote(ui: Console, repo: Git): Promise<string | undefined>
 async function verifyRemoteSnapshot(repo: Git, snapshot: RemoteTarget): Promise<void> {
   await unchangedRemoteTarget(repo, snapshot);
   if ((await repo.remotes()).indexOf(snapshot.remote) < 0) throw new GitError('远程在确认期间被移除，未执行操作。');
+}
+
+export async function fetchRemote(ui: Console, directory: Directory): Promise<void> {
+  let repo = await repository(directory);
+  await repo.ensureReady();
+  const snapshot = await head(repo);
+  const remote = await chooseRemote(ui, repo); if (!remote) return;
+  const urls = await validateExistingRemote(repo, remote, false);
+  repo = await remoteContext(ui, repo, urls);
+  ui.text(`来源：${redact(urls[0])}\n目标：当前仓库的远程缓存；不 prune，不合并，不 stash，不 push。`);
+  if (!await ui.routineConfirm('确认单独联网 fetch 这个远程？')) return;
+  await verifyHead(repo, snapshot);
+  if (!isDeepStrictEqual(urls, await validateExistingRemote(repo, remote, false))) throw new GitError('确认期间远程地址发生变化，请重新预览。');
+  await repo.run(['fetch', '--no-prune', '--no-prune-tags', '--no-recurse-submodules', '--', remote]);
+  ui.text('fetch 已完成；工作区与当前分支没有自动合并。');
+}
+
+export async function setUpstream(ui: Console, directory: Directory): Promise<void> {
+  const repo = await repository(directory);
+  await repo.ensureReady();
+  const snapshot = await head(repo);
+  if (!snapshot[1]) throw new GitError('当前分支还没有提交，不能设置上游。');
+  const refs = await cachedRemoteRefs(repo);
+  if (!refs.length) throw new GitError('没有可用的远程缓存分支；请单独选择 fetch，不会自动联网。');
+  const choice = await ui.menu('选择当前分支的上游（远程缓存）', refs.map(ref => `[远程缓存] ${ref.name} | ${ref.oid} | ${JSON.stringify(ref.subject)}`));
+  if (!choice) return;
+  const source = refs[choice - 1];
+  ui.text(`本地：${snapshot[0]}\nOID：${snapshot[1]}\n摘要：${JSON.stringify(await repo.value('show', '-s', '--format=%s', snapshot[1]))}`);
+  ui.text(`上游目标（缓存）：${source.name}\nOID：${source.oid}\n摘要：${JSON.stringify(source.subject)}`);
+  if (!await ui.routineConfirm(`设置 ${snapshot[0]} 的上游为 ${source.name}？（不联网）`)) return;
+  await verifyHead(repo, snapshot, source);
+  await repo.run(['branch', `--set-upstream-to=${source.ref}`, '--', snapshot[0]]);
+  ui.text('已设置上游；没有 fetch 或 push，也没有新建或切换分支。');
 }
 
 export async function forcePush(ui: Console, directory: string): Promise<void> {
@@ -180,7 +245,7 @@ async function removeRemote(ui: Console, repo: Git): Promise<void> {
 
 export async function remotesMenu(ui: Console, directory: string): Promise<void> {
   const repo = await repository(directory);
-  const choice = await ui.menu('远程与上传工具', ['查看/管理远程地址', '添加远程（含新建 GitHub 仓库）', '仅上传已有提交', 'force-with-lease / 无条件 force 强推', '删除远程分支', '远程改名', '移除远程']);
+  const choice = await ui.menu('远程与上传工具', ['查看/管理远程地址', '添加远程（含新建 GitHub 仓库）', '仅上传已有提交', 'force-with-lease / 无条件 force 强推', '删除远程分支', '远程改名', '移除远程', '单独 fetch 远程（更新缓存）', '设置当前分支上游（使用缓存）']);
   if (!choice) return;
   if (choice === 1) {
     const names = await repo.remotes();
@@ -197,4 +262,6 @@ export async function remotesMenu(ui: Console, directory: string): Promise<void>
   else if (choice === 5) await deleteRemoteBranch(ui, directory);
   else if (choice === 6) await renameRemote(ui, repo);
   else if (choice === 7) await removeRemote(ui, repo);
+  else if (choice === 8) await fetchRemote(ui, repo);
+  else if (choice === 9) await setUpstream(ui, repo);
 }

@@ -2,75 +2,84 @@
 
 版本目标：**0.5.0**。本表区分“代码是否有可运行入口”和“在哪些环境实际验收过”。菜单存在、假工具测试或计划文字都不能替代实测。
 
+主菜单收为 **日常项目、远程传输、GitHub 协作、账号与资料、项目管理、查看与诊断** 六组；下表用分组和嵌套动作名称定位，不沿用旧版的顶层编号。
+
 ## 已实现或本版补齐
 
 | 用户任务 | 状态 | 入口与范围 | 关键边界 |
 |---|---|---|---|
-| 首次配置、多账号、项目独立密钥 | 已实现 | 1 / 10；生成、导入、编辑、绑定、换认证、删除 | SSH profile、提交署名和 API actor 分开；仅改显示标签保留绑定；不保存 GitHub 明文密码/token |
-| 项目选择、收藏、最近使用 | 已实现 | 9 / 20；列表、搜索、收藏、移除、路径重映射 | 独立 `projects.json`；不按同名目录猜绑定 |
-| 下载已有项目 | 已实现 | 2；GitHub、Enterprise、普通 Git、HTTPS、SSH alias | 托管 SSH、原生 SSH、HTTPS 由项目传输配置选择；可复用已有空目录、名称冲突局部重问；失败不删除已下载目录 |
-| 初始化、提交、本地保存 | 已实现 | 3 / 4 / 12 | 新仓库默认 main；已有仓库不自动改名；保留部分暂存 |
-| 取消暂存 | 0.5.0 新增 | 15；按文件恢复 index，支持空 HEAD、删除、重命名、特殊字节路径 | 工作区内容不变 |
-| 文件还原 | 0.5.0 新增 | 15；HEAD/index/指定提交 → worktree/index/both | 选择范围、来源和丢弃影响；不顺带 clean |
-| revert / cherry-pick | 0.5.0 新增 | 17；普通/合并提交 mainline、冲突继续/跳过/中止 | 单个或多个固定 OID / 明确区间；revert 创建反向提交，cherry-pick 复制提交 |
-| 普通 push / 独立仅上传 | 已实现 / 0.5.0 新增入口 | 4 / 14 / 16 | 固定单完整 refspec、`--no-follow-tags`；普通失败不会自动 force |
-| force push | 0.5.0 新增 | 16；`force-with-lease` 或无条件 `--force` | lease 从实际 push URL 查询目标 OID；目标/源 OID变化停止；不推标签 |
-| pull / fetch / 上游 | 已实现，有边界 | 5 / 7 | pull 仅 ff-only；不自动 stash、merge、rebase；多个远程明确选择 |
-| remote 管理 | 0.5.0 新增 | 16；查看、fetch/push 列表替换/逐项添加移除、改名、移除、删除远程分支 | 不暗改其他 upstream；传输每次只处理单地址，多地址可拆为独立远程；外部 include 配置需在来源修改 |
-| 分支 | 已实现并扩展 | 7；新建、切换、跟踪、改名、删除已合并、强删未合并 | 允许携带 Git 能保留的修改，不强制 stash；真正覆盖由 Git 拒绝；其他 worktree 占用及远程分支删除分别处理 |
-| 合并和冲突 | 已实现并扩展 | 7 / 17；merge、stage 选择、ours/theirs、删除一侧、继续/中止 | 可显式合并独立历史，一次影响确认；不自动判断代码逻辑；rebase/cherry-pick 的 ours/theirs 语义单独说明 |
-| stash | 已实现，有边界 | 11 | 可包含未跟踪但不含 ignored；恢复失败保留现场，不冒充 merge 恢复 |
-| rebase / bisect | 0.5.0 新增 | 17；变基开始/继续/跳过/中止、交互式 todo；手工 good/bad/skip/reset | 正确区分 rebase 与 am，允许合法 detached HEAD；不自动运行待测仓库命令 |
-| reset | 0.5.0 新增 | 15；soft / mixed / hard | hard 可能删除阻挡 tracked 路径的 untracked/ignored；不强制先 stash/备份；托管 data 受保护 |
-| clean | 0.5.0 新增 | 15；普通未跟踪、仅 ignored、两者；嵌套仓库二次 force 独立 | 预览与执行同 scope；clean 删除不能由 reflog 恢复；托管 data/私钥/known_hosts 不纳入普通项目清理 |
-| 历史、详情、搜索、图、reflog | 0.5.0 新增 | 6 / 18 | 本地提交和远程缓存；reflog 可创建恢复分支，不是未提交内容备份 |
-| .gitignore、README、许可证 | 0.5.0 新增 | 21 → 模板 | 规则/文件生成不自动提交；停止跟踪只改 index；忽略规则不能撤销历史泄露 |
-| 大文件自动忽略 | 已实现 | 3 / 4 / 12；选择提交文件前默认检查 | 超过 50 MiB 的全新未跟踪普通文件自动追加精确 `.gitignore` 规则，无需确认、不使用 LFS；不删除文件、不改变已有跟踪/暂存；规则写入失败时只跳过对应文件 |
-| worktree | 0.5.0 新增 | 21 | 创建、列表、切换、移动、锁定/解锁、移除、prune；不按 common-dir 猜 profile |
-| 子模块 | 0.5.0 新增 | 21 | 添加、初始化、更新、状态、进入、移除；默认不递归改子模块工作区 |
-| Git LFS | 0.5.0 新增 | 21 | 依赖外部 git-lfs；检测、track/untrack、status、fetch/pull/push；endpoint 与 Git remote 分开核对 |
-| GitHub 个人/组织仓库 | 已实现并扩展 | 3 / 19 | 个人建库公开/私有；组织 owner 与认证 actor 分开；空仓库不隐式加 README |
-| GitHub 仓库列表、搜索、查看、fork | 0.5.0 新增 | 19 | fork 不隐式 clone/add-remote；明确 source/upstream/push 目标 |
-| SSH 公钥授权 | 0.5.0 新增 | 19 | 只读取明确 `.pub`，通过 gh 上传；不读取私钥；授权不等于仓库写权限 |
-| Pull Request / Review | 0.5.0 新增 | 19 | 列表、查看正文/差异/评论、创建、checkout、评论、review、合并、关闭/重开；checkout 重名可另名/仅切换/显式重建 |
-| Issues | 0.5.0 新增 | 19 | 列表、查看、创建、编辑、评论、关闭/重开 |
-| 标签和 Release | 0.5.0 新增 | 19 | 单标签 refspec；Release 创建/编辑/发布/查看、附件上传/下载/删除；本地下载可换名/显式覆盖，失败保留原件；覆盖和删 tag 明确列出 |
-| 仓库管理 | 0.5.0 新增 | 19 | 可见性、改名、删除、协作者/团队权限操作；服务端与本地 remote 分开报告 |
-| 主机和传输 | 0.5.0 新增 | 21 | GitHub.com、Enterprise、通用 Git；托管 SSH、原生 SSH、HTTPS；alias/端口/代理/跳板由明确模式控制 |
-| 资料备份、恢复、搬迁 | 0.5.0 新增 | 21 | `manifest.json + files/`、完整性校验、路径/链接/硬链接检查、staging 后切换；默认保留源 |
-| 快捷模式 | 已实现并调整 | 13 | 日常只读/提交/同步少确认；破坏性写入一次摘要硬确认 |
+| 首次配置、多账号、项目独立密钥 | 已实现 | 账号与资料 → 账号与密钥 / 首次配置与依赖指引；生成、导入、编辑、绑定、换认证、删除 | SSH profile、提交署名和 API actor 分开；仅改显示标签保留绑定；不保存 GitHub 明文密码/token |
+| 项目选择、收藏、最近使用 | 已实现并补齐启动引导 | 裸命令启动 / 项目管理 → 切换项目目录 / 收藏与最近项目；继续上次、当前目录、本地/新建/下载、最近收藏 | 只输入 `autogit` 即可；明确选择后才记住项目；失效路径不静默回退；独立 `projects.json`，不按同名目录猜绑定 |
+| 下载已有项目 | 已实现 | 日常项目 → 下载已有项目；GitHub、Enterprise、普通 Git、HTTPS、SSH alias | 托管 SSH、原生 SSH、HTTPS 由项目传输配置选择；可复用已有空目录、名称冲突局部重问；失败不删除已下载目录 |
+| 初始化、提交、本地保存 | 已实现 | 日常项目 → 上传本地项目 / 保存修改并上传 / 仅保存到本地 | 新仓库默认 main；已有仓库不自动改名；保留部分暂存 |
+| 普通 push / 独立仅上传 | 已实现 | 日常项目 → 保存修改并上传 / 仅上传已有提交；远程传输 → 仅上传 | 固定单完整 refspec、`--no-follow-tags`；普通失败不会自动 force |
+| force push | 已实现 | 远程传输 → force-with-lease / 无条件 force 强推 | `force-with-lease` 或无条件 `--force`；lease 从实际 push URL 查询目标 OID；目标/源 OID变化停止；不推标签 |
+| pull / fetch / 上游 | 已实现，有边界 | 日常项目 → 获取远程最新代码；远程传输 → 独立 fetch / 设置当前分支上游 | pull 仅 ff-only；不自动 stash、merge、rebase；上游只关联当前分支；多个远程明确选择 |
+| remote 管理 | 已实现 | 远程传输 → 远程地址管理 / 添加 / 改名 / 移除 / 删除远程分支 | 查看、fetch/push 列表替换/逐项添加移除、改名、移除、删除远程分支；不暗改其他 upstream |
+| 历史、详情、搜索、图 | 已实现 | 查看与诊断 → 状态/差异/只读历史 | 本地提交和远程缓存；不提供 reflog 恢复分支或本地历史改写 |
+| .gitignore、README、许可证 | 已实现 | 项目管理 → 模板 | 规则/文件生成不自动提交；停止跟踪只改 index；忽略规则不能撤销历史泄露 |
+| 大文件自动忽略 | 已实现 | 日常项目 → 上传本地项目 / 保存修改并上传 / 仅保存到本地；选择文件前检查 | 超过 50 MiB 的全新未跟踪普通文件自动追加精确 `.gitignore` 规则，不调用 LFS；不删除文件、不改变已有跟踪/暂存；规则写入失败时只跳过对应文件 |
+| GitHub 个人/组织仓库 | 已实现 | 日常项目 → 上传本地项目；GitHub 协作 → 新建个人 / 组织空仓库 | 个人建库公开/私有；组织 owner 与认证 actor 分开；空仓库不隐式加 README |
+| GitHub 仓库列表、搜索、查看、fork | 已实现 | GitHub 协作 → 选择仓库 / 查看 / Fork | fork 不隐式 clone/add-remote；明确 source/upstream/push 目标 |
+| SSH 公钥授权 | 已实现 | GitHub 协作 → 向选定账号上传 SSH 公钥 | 只读取明确 `.pub`，通过 gh 上传；不读取私钥；授权不等于仓库写权限 |
+| Pull Request / Review | 已实现 | GitHub 协作 → Pull requests | 列表、查看正文/差异/评论、创建、评论、review、服务端合并、关闭/重开；merge/squash/rebase 是服务器策略，不执行本地 merge/rebase 或 checkout |
+| Issues | 已实现 | GitHub 协作 → Issues | 列表、查看、创建、编辑、评论、关闭/重开 |
+| 标签和 Release | 已实现 | GitHub 协作 → Tags / Releases | 单标签 refspec；Release 创建/编辑/发布/查看、附件上传/下载/删除；本地下载可换名/显式覆盖，失败保留原件；覆盖和删 tag 明确列出 |
+| 仓库管理 | 已实现 | GitHub 协作 → 可见性 / 改名 / 删除 / 协作者与团队权限 | 可见性、改名、删除、协作者/团队权限操作；服务端与本地 remote 分开报告 |
+| 主机和传输 | 已实现 | 账号与资料 → 主机 / SSH alias / 代理 | GitHub.com、Enterprise、通用 Git；托管 SSH、原生 SSH、托管/外部 HTTPS；alias/端口/代理/跳板由明确模式控制；托管 HTTPS 仅当前会话加密 Token |
+| 加密凭据库与独立解锁密码 | 已实现；正式验收结果以报告为准 | 每次启动；账号与资料 → HTTPS / GitHub 凭据 / 使用设置 | 先选择资料位置，再用独立 AutoGit 密码解锁 scrypt 包装的 AES-256-GCM 库；新密码至少 12 字符、最多 1024 UTF-8 字节、输入两次；不验证系统或 GitHub 密码、不需要 root/PAM/管理员；SSH 私钥、HTTPS/gh Token 不落盘明文 |
+| 解锁失败、恢复码与改密 | 已实现 | 启动失败菜单；账号与资料 → 使用设置 → 修改 AutoGit 解锁密码 | 错误后明确重试/恢复/退出，密码最多 3 次；忘记可回车进入恢复选择；恢复码恢复须确认新密码并轮换恢复码；旧密码改密保留同一存活会话/DEK及原恢复码；无原密码和恢复码不能找回 |
+| 资料备份、恢复、搬迁 | 已实现 staging 解锁门禁；跨平台实测未完成 | 账号与资料 → 资料备份 / 恢复 / 搬迁 | `manifest.json + files/`、完整性校验、路径/链接/硬链接检查；交互恢复在 staging 用备份库自己的密码解密，一次验证后启用；无 UI 仅可用当前存活同一 DEK 验证副本，不可绕过独立密文解锁；默认保留源；恢复码不在备份 |
+| 快捷模式 | 已实现 | 账号与资料 → 使用设置 | 日常只读/提交/同步少确认；破坏性写入一次摘要硬确认 |
 
-## 高级操作的确认规则
+## 本版有意移除
 
-- 普通 push/pull 不会因为失败自动升级为 force、merge 或 rebase。
-- 强推、hard reset、clean、强删分支、远程删分支、仓库删除/改名/可见性修改、资料替换/删除源等操作都可执行；它们先显示目标、OID、范围和影响，再一次 `confirm`。
+以下是实际功能裁剪，不是默认隐藏、权限拒绝或待验证的已有能力：
+
+- 本地分支新建/切换/跟踪建分支/改名/删除；手动 merge 与冲突处理。
+- stash、取消暂存/文件还原工具、reset、clean。
+- revert、cherry-pick、rebase、bisect 及进行中操作的继续/跳过/中止；reflog 恢复分支。
+- PR 本地 checkout（含同名分支重建）、worktree、子模块和 Git LFS 管理。
+
+移除的是 AutoGit 的向导、专属实现与发行模块，不删除用户仓库已有分支、stash、多工作区、子模块、LFS 对象或历史，也不改个人资料 schema/凭据内容。只读检测冲突、进行中操作、gitlink/嵌套仓库及拒绝覆盖保护仍保留；复杂状态须使用外部 Git 工具处理，不自动 abort/reset/clean。
+
+服务端 PR 的 merge/squash/rebase 策略仍属于远端 API；本地标签准备、单标签上传/删除仍属于发布管理，不在裁剪范围。大文件自动忽略继续使用独立 `.gitignore` 规则，不调用、安装或配置 Git LFS。
+
+## 保留写操作的确认规则
+
+- 普通 push/pull 不会因为失败自动升级为 force、merge 或 rebase；本地分叉、冲突和进行中操作不会转入已移除的恢复向导。
+- 强推、远程删分支、仓库删除/改名/可见性修改、标签覆盖/删除、资料替换/删除源等保留操作先显示目标、OID、范围和影响，再一次 `confirm`；不强制先 stash 或备份。
 - 选择“无条件 force”就是选择无条件 force，不会被软件改成 lease；lease 查询失败也不能被当作“远端不存在”。
-- reset/clean 不要求用户先 stash 或备份。可选恢复分支或备份会准确说明只包含哪些 Git 对象/文件，不能把 reflog 或 SHA-256 说成未提交内容恢复或加密。
+- 备份准确说明只包含哪些资料，不是项目工作区恢复；SHA-256 用于复制完整性，不是加密。
 
-## 仍有范围边界
+## 部分实现与明确不支持
 
-这些不是因为“担心安全”而隐藏的拒绝，而是服务/平台或实现边界：
+这些服务/平台或实现边界与上面的“有意移除”、下面的“未验证”分开记录：
 
-- 通用 Git 服务支持 Git 传输；非 GitHub 的专有 PR、Issue、Review、Release API 需要对应 provider，不能把 GitHub API 换域名冒充通用。
-- GitHub/Enterprise 的权限、分支保护、SSO/组织审批由服务器决定，AutoGit 不绕过；失败保留已完成步骤和恢复入口。
-- 不复制 Git/gh 的每一个冷门参数；高级菜单覆盖本台账列出的完整日常闭环。
-- hooks、filters、ProxyCommand、外部凭据/签名工具可能有自己的副作用；AutoGit 不把不可信仓库变成沙箱。
-- LFS 需要用户自行安装外部 `git-lfs`；AutoGit 不自动下载安装程序。大文件自动忽略是独立的 `.gitignore` 规则，不调用、不安装、不配置 Git LFS。worktree/子模块检出跳过 LFS 自动下载，需在对应仓库明确拉取 LFS 对象。
-- 交互式 rebase 使用原生 todo 编辑器；`am` 支持恢复已有操作，不提供新的邮件补丁导入向导。GitHub 差异展示上限 16 MiB、附件单文件上限 64 MiB，不是 GitHub 所有参数和接口的复制。
+- 部分实现：保留的是列出的常用 Git/gh 工作流，并非每个参数或所有 API；GitHub 差异展示上限 16 MiB、附件单文件上限 64 MiB。远程传输每次只处理单地址，多地址需拆为独立远程；外部 include 配置须在来源修改。
+- 部分实现：旧托管密钥迁移逐账号验证/替换，尚非跨所有文件的代际事务；Windows Job Object 进程树清理尚未实现，agent 清理依赖父 stdin EOF / 信号。
+- 不支持：非 GitHub 的专有 PR、Issue、Review、Release API；通用 Git 服务仅支持 Git 传输，不能把 GitHub API 换域名冒充通用 provider。
+- 不支持：自定义 HTTPS 端口、系统账户认证、Hello/PIN/MFA；它们也不是启动前提。CLI 私钥导入上限 32 KiB，秘密不接受命令行参数、环境变量、普通 stdin 或配置文件注入。
+- GitHub/Enterprise 的权限、分支保护、SSO/组织审批由服务器决定，AutoGit 不绕过；失败保留已完成步骤并准确报告。
+- hooks、filters、ProxyCommand、外部凭据/签名工具可能有自己的副作用；保留通用 Git 的不递归等保护不意味着把不可信仓库变成沙箱。
 
 ## 资料与 schema
 
-- AutoGit 资料仍在独立文件夹，不进入 npm 包；profiles/bindings schema 2、settings schema 1 保持兼容。
+- AutoGit 资料仍在独立文件夹，不进入 npm 包；profiles/bindings schema 2、settings schema 1 保持兼容。首次先选择位置、设置并再次确认独立密码，有效匹配后才创建加密库和缺少的目录；正常重启只显示已记住的位置。位置指针须在解锁及迁移验证后才提交；已记住的库消失时先引导找回或明确新建，不静默覆盖或初始化空库。切换已有资料要输入目标库自己的密码；无可用资料时另行明确确认新建。
 - 新增 `projects.json`、`hosts.json` 和备份目录使用独立 schema 1，不把收藏/主机配置硬塞入既有 settings。
-- 备份可以包含免口令托管私钥；备份是未加密文件，SHA-256 只用于完整性检查。外部 gh token/config、机器 location pointer 不在备份范围内。
+- 解锁会话中的新备份包含密文库和可读元数据，不含 AutoGit 解锁密码、恢复码、明文 DEK 或会话端点；SHA-256 只用于完整性检查。外部工具凭据和机器 location pointer 不在范围内。旧备份可能仍有免口令私钥，迁移不会擦除历史副本。
+- 凭据库 schema 1：随机 256-bit DEK；scrypt 固定 N=32768、r=8、p=1；AES-256-GCM 独立 nonce/AAD 与整库认证。旧加密库仍用原包装密码解密，仅用于解密、绝不再验证系统账户；解锁后可在设置中改为独立密码。恢复码用于重新包装同一 DEK并轮换恢复码；普通改密保留原恢复码。二者都无法撤销其他进程已解锁的内存或历史备份，也不防同 UID/root 恶意进程、调试器或内存转储。
+- 旧托管密钥逐账号执行：先写密文、解密/公钥核验，再原子替换引用；中途失败已完成账号保留，未完成账号下次继续。尚非跨所有文件的代际事务，不宣称任意崩溃情况下全库回滚。
 - 项目移动后必须明确旧根→新根映射；不按目录名猜账号。SSH 程序绝对路径跨系统可能需要重新选择。
 
 ## 环境验收
 
-源码交付目录只保留当前版本的一套正式证据。0.5.0 的集中验收以 `artifacts/verification-0.5.0.txt`、`artifacts/release-0.5.0.json` 和对应测试日志为准，由 `npm run verify` 更新；这些报告不随 npm 包安装。按实际结果记录通过与跳过：
+源码交付目录只保留当前版本的一套正式证据。裁剪版 0.5.0 须以当前源码重新生成的 `artifacts/verification-0.5.0.txt`、`artifacts/release-0.5.0.json` 和对应测试日志为准，由 `npm run verify` 更新；旧同版本报告、计划和菜单存在都不能证明新分组、保留工作流或七个退役发行模块缺失已通过。这些报告不随 npm 包安装。按实际结果记录通过与跳过：
 
-- Linux / Node 22 的本地 bare、fake gh、PTY、真实 CLI：可验证离线功能闭环；
-- Windows、Node 24、真实 GitHub/Enterprise 登录、组织权限、PR/Issue/Release、真实 LFS 服务、SSH alias/代理/跳板：没有实测记录就保持“未验证”；
+- Linux / Node 22 的本地 bare、fake gh、PTY 可验证离线功能闭环；旧工作流 CLI 测试使用**代码级解锁替身**，不代表生产解锁验收。独立密码的生产 CLI PTY 测试应以合成密码验证创建/重启/错误密码不入菜单、回显保护及退出；没有本次正式报告就不标为已通过。托管 SSH 另用合成密钥验证 Vault/profile → 单钥匙原生 agent、并发复用、`ssh -G` 路径和关闭清理，不连接真实 SSH 服务；无安全终端的生产 CLI 必须拒绝进入；
+- 原生 helper 只承担密钥生成/导入、会话 agent 和必要的文件权限保护，不再提供系统密码登录入口或随包安装 PAM。普通用户安装使用用户可写的 npm prefix 与用户 PATH，Linux 无需 sudo/root，Windows 无需管理员。旧 OS 认证测试或历史证据不能当作本次独立密码流程的验收；Windows 交叉编译不等于 Windows 终端、SID/DACL、named pipe 或原生 OpenSSH 运行验收；
+- Windows Job Object 进程树清理尚未实现；agent 依赖父 stdin EOF / 信号清理，不宣称覆盖全部崩溃与进程树场景。密码不接受参数、环境变量、普通 stdin 管道或配置文件注入；仅测试可用代码构造 `secretInput`/解锁替身，不是生产后门。系统账户认证、Hello/PIN/MFA 不是本版功能，也不是启动前提。自定义 HTTPS 端口不支持；CLI 私钥导入上限 32 KiB。
+- Windows、Node 24、真实 GitHub/Enterprise 登录、组织权限、PR/Issue/Release、SSH alias/代理/跳板：没有实测记录就保持“未验证”；Git LFS 管理已移除，不再作为待验收能力；
 - 不读取个人私钥/token/外部 gh 配置，不进行真实 GitHub 写操作；不公开发布 npm；不默默替换既有全局安装。
 
 每次新增功能必须同步入口、取消、失败恢复、离线测试、实际环境证据和本台账；不能只因为菜单里出现一项就标成完成。

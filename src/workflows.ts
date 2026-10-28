@@ -10,6 +10,7 @@ import type { Profile } from './profiles.js';
 import type { Console } from './ui.js';
 import { chooseCloneTarget, verifyCloneTarget } from './clone-target.js';
 import { autoIgnoreLargeFiles } from './large-files.js';
+import { currentSession } from './session.js';
 
 /** A one-operation destination; never persisted in Git config or a process-global registry. */
 export interface RemoteTarget {
@@ -306,10 +307,20 @@ export async function remoteContext(ui: Console, repo: Git, urls: string[]): Pro
   const transport = await resolveTransport(repo.directory);
   const usesSsh = urls.some((url) => url.startsWith('ssh://') || /^[^/\s:]+@[^/\s:]+:/u.test(url) || /^[A-Za-z0-9_.-]+:[^/]/u.test(url));
   if (usesSsh && transport?.mode === 'https') throw new GitError('项目传输模式是 HTTPS，但实际远程地址使用 SSH；请在项目工具切换为托管/原生 SSH，或在远程管理修改地址。没有使用默认 SSH 身份联网。');
+  const { bindProject, chooseProfile, resolveBinding, profileGit } = await import('./profiles.js');
+  const binding = await resolveBinding(repo.directory);
+  const httpsUrl = urls.find(url => url.startsWith('https://'));
+  if (httpsUrl && currentSession() && transport?.credentials !== 'external') {
+    const host = new URL(httpsUrl).hostname;
+    const httpsTransport = transport?.mode === 'https' ? transport : { mode: 'https' as const, host: { provider: host === 'github.com' ? 'github' as const : 'generic' as const, host, apiHost: host === 'github.com' ? 'api.github.com' : '', webBase: `https://${host}`, sshHost: host } };
+    const profile = binding ?? await chooseProfile(ui);
+    if (profile == null) throw new GitError('托管 HTTPS 必须选择 AutoGit 账号；没有联网。请先到“账号与密钥”新建或绑定。');
+    if (!binding) { if (!(await ui.routineConfirm(`此项目使用 ${profile.label} 的托管 HTTPS Token？`))) throw new GitError('已取消账号绑定，未联网。'); await bindProject(repo.directory, profile); }
+    return (await profileGit(repo.directory, profile, httpsTransport, urls.length === 1 ? httpsUrl : undefined)).repository();
+  }
   if (transport?.mode === 'native-ssh' || transport?.mode === 'https') return (await projectGit(repo.directory)).repository();
   if (!usesSsh) return repo;
-  const { bindProject, chooseProfile, resolveBinding } = await import('./profiles.js');
-  if ((await resolveBinding(repo.directory)) != null) return (await projectGit(repo.directory)).repository();
+  if (binding != null) return (await projectGit(repo.directory)).repository();
   ui.text('这个项目还未选择软件账号；选一次后会记住，不会使用默认外部 SSH 密钥。');
   const profile = await chooseProfile(ui);
   if (profile == null) throw new GitError('没有选择软件账号，未联网。请先到“账号与密钥”新建或导入。');
@@ -324,7 +335,7 @@ export async function protectAccountData(repo: Git, changes: Change[]): Promise<
   for (const change of changes) {
     for (const name of [change.path, change.original]) {
       if (name && isWithin(await canonicalPath(path.resolve(repo.directory, name)), data)) {
-        throw new GitError('提交内容包含 AutoGit 账号数据，已停止；请取消暂存 data 并排除它，不要上传托管密钥。');
+        throw new GitError('提交内容包含 AutoGit 账号数据，已停止；请使用外部 Git 将 data 从暂存区移除并排除它，不要上传托管密钥。');
       }
     }
   }
@@ -377,8 +388,8 @@ export async function push(ui: Console, original: Git, options: PushOptions = {}
     const target = options.branch ?? await ui.ask('远程分支名称', branch);
     mergeRef = `refs/heads/${target}`;
   }
-  if (remote === '.') throw new GitError('当前上游指向本地分支，不是远程仓库。请检查分支配置后再推送。');
-  if (!(await repo.remotes()).includes(remote)) throw new GitError('上游引用的远程已不存在，请先修复分支关联。');
+  if (remote === '.') throw new GitError('当前上游指向本地分支，不是远程仓库。请在远程工具重新设置当前分支上游后再推送。');
+  if (!(await repo.remotes()).includes(remote)) throw new GitError('上游引用的远程已不存在，请在远程工具检查远程地址并重新设置当前分支上游。');
   if (!mergeRef.startsWith('refs/heads/') || (await repo.run(['check-ref-format', mergeRef], { check: false })).status) {
     throw new GitError('远程分支名称无效，已停止；没有更改上游。');
   }
@@ -423,7 +434,7 @@ export async function push(ui: Console, original: Git, options: PushOptions = {}
     await repo.run([...args, '--', remote, `${sourceOid}:${mergeRef}`], { interactive: true });
   } catch (error) {
     if (!(error instanceof GitError)) throw error;
-    throw new GitError(`上传没有确认成功，本地提交仍在；请先检查远端结果再重试。\n若提示 rejected/fetch first，可先获取更新；需要改写远端历史时，在“远程与强推工具”明确选择 lease 或无条件 force。没有自动升级推送方式。\n${error.message}`);
+    throw new GitError(`上传没有确认成功，本地提交仍在；请先检查远端结果再重试。\n若提示 rejected/fetch first，可先获取更新；若本地历史已分叉，请使用外部 Git 处理后重试，不要用强推解决本地分叉。仅在确实需要改写远端历史时，在远程工具明确选择 lease 或无条件 force。没有自动升级推送方式。\n${error.message}`);
   }
   ui.text(`${mode === 'normal' ? '推送' : '强推'}成功：远程已接受本次上传。`);
   if (setUpstream) {
@@ -515,7 +526,7 @@ export async function saveAndPush(ui: Console, directory: string, { upload = tru
   }
   const gitlinks = new Set(splitNul((await repo.run(['ls-files', '--stage', '-z'])).stdout).filter(entry => entry.subarray(0, 7).equals(Buffer.from('160000 '))).map(entry => decodePath(entry.subarray(entry.indexOf(9) + 1))));
   for (const change of selected) {
-    if (!gitlinks.has(change.path) && await exists(path.join(repo.directory, change.path, '.git'))) throw new GitError('选择中包含尚未登记的嵌套 Git 仓库。请先在项目工具中添加为子模块，或仅选择其中普通文件。');
+    if (!gitlinks.has(change.path) && await exists(path.join(repo.directory, change.path, '.git'))) throw new GitError('选择中包含尚未登记的嵌套 Git 仓库。请取消选择该目录；如需调整嵌套仓库，请使用外部 Git 处理后重试。');
   }
   const included = [...staged, ...selected];
   if (!included.length) {
@@ -622,7 +633,7 @@ export async function clone(ui: Console, directory: string): Promise<string | un
   if (usesSsh && transport?.mode === 'https') throw new GitError('项目传输模式是 HTTPS，但下载地址使用 SSH；请先切换传输模式或使用 HTTPS 地址。没有联网下载。');
   if (transport?.mode === 'native-ssh') {
     const context = await projectGit(directory);
-    runner = new Git(parent, { config: context.overrides, env: context.environment, rejectEnv: context.rejectedEnvironment });
+    runner = new Git(parent, { config: context.overrides, orderedConfig: context.orderedConfig, env: context.environment, rejectEnv: context.rejectedEnvironment });
   }
   if ((effective.startsWith('git@') || effective.startsWith('ssh://') || /^[^/:]+:[^/]/u.test(effective)) && transport?.mode !== 'native-ssh') {
     profile = await chooseProfile(ui);
@@ -637,7 +648,14 @@ export async function clone(ui: Console, directory: string): Promise<string | un
     runner = await profileGit(parent, profile, cloneTransport);
     ui.text(`下载使用 AutoGit 账号：${profile.label}；成功后自动绑定此项目。`);
   } else if (effective.startsWith('https://')) {
-    ui.text('HTTPS 使用 Git 的凭据助手认证；SSH 账号密钥不会改变 HTTPS 登录身份。');
+    if (currentSession() && transport?.credentials !== 'external') {
+      profile = await chooseProfile(ui);
+      if (profile == null) { ui.text('未选择托管 HTTPS 账号，没有联网下载。'); return; }
+      const host = new URL(effective).hostname;
+      cloneTransport = transport?.mode === 'https' ? transport : { mode: 'https', host: { provider: host === 'github.com' ? 'github' : 'generic', host, apiHost: host === 'github.com' ? 'api.github.com' : '', webBase: `https://${host}`, sshHost: host } };
+      runner = await profileGit(parent, profile, cloneTransport, effective);
+      ui.text(`HTTPS 使用加密库中的 ${profile.github_login} Token，不回退外部凭据助手；成功后绑定此项目。`);
+    } else ui.text('HTTPS 使用外部 Git 凭据助手；外部缓存不纳入 AutoGit 加密库。');
   }
   ui.text(`来源：${redact(effective)}\n保存到：${target}`);
   if (effective !== address) ui.text('注意：Git 的 URL 重写配置改变了原始地址，以上显示的是实际目标。');
@@ -647,7 +665,7 @@ export async function clone(ui: Console, directory: string): Promise<string | un
     const { ProfileStore } = await import('./profiles.js');
     const selected = await new ProfileStore().load(profile.profile_id);
     if (!isDeepStrictEqual(selected, profile)) throw new GitError('下载账号在确认期间变化，未下载。');
-    runner = await profileGit(parent, selected, cloneTransport);
+    runner = await profileGit(parent, selected, cloneTransport, effective.startsWith('https://') ? effective : undefined);
   }
   await verifyCloneTarget(destination);
   await runner.run(['clone', '--', address, target], { interactive: true });
@@ -674,14 +692,14 @@ export async function pull(ui: Console, directory: string): Promise<void> {
   const branch = await repo.branch();
   const remote = await repo.config(`branch.${branch}.remote`);
   const mergeRef = await repo.config(`branch.${branch}.merge`);
-  if (!remote || remote === '.' || !mergeRef) throw new GitError('当前分支没有远程上游。请进入“分支与合并 → 远程 fetch → 设置当前分支上游”；这不需要先上传。');
+  if (!remote || remote === '.' || !mergeRef) throw new GitError('当前分支没有远程上游。请在远程工具先 fetch，再设置当前分支上游；这不需要先上传。');
   if (!(await repo.remotes()).includes(remote) || !mergeRef.startsWith('refs/heads/') || (await repo.run(['check-ref-format', mergeRef], { check: false })).status) {
-    throw new GitError('上游配置无效，请检查远程和分支配置。');
+    throw new GitError('上游配置无效，请在远程工具检查远程地址并重新设置当前分支上游。');
   }
   const urls = await validateExistingRemote(repo, remote);
   repo = await remoteContext(ui, repo, urls);
   const target = await snapshotRemoteTarget(repo, remote);
-  const { repositoryStamp, verifyRepositoryStamp } = await import('./destructive.js');
+  const { repositoryStamp, verifyRepositoryStamp } = await import('./repository-state.js');
   const { resolveBinding } = await import('./profiles.js');
   const { resolveTransport } = await import('./hosts.js');
   const stamp = await repositoryStamp(repo);
@@ -699,7 +717,7 @@ export async function pull(ui: Console, directory: string): Promise<void> {
 
 export async function inspect(ui: Console, directory: string): Promise<void> {
   const repo = await (await projectGit(directory)).repository();
-  const choice = await ui.menu('查看项目', ['文件状态', '未暂存差异', '已暂存差异', '最近 20 条提交']);
+  const choice = await ui.menu('查看项目', ['文件状态', '未暂存差异', '已暂存差异', '最近 20 条提交', '只读历史（分页 / 搜索 / 详情 / 图）']);
   if (choice === 1) await showStatus(ui, repo);
   else if (choice === 2 || choice === 3) {
     const args = ['diff', '--no-ext-diff', '--no-textconv', '--stat'];
@@ -710,10 +728,8 @@ export async function inspect(ui: Console, directory: string): Promise<void> {
   } else if (choice === 4) {
     if (!(await repo.hasCommits())) ui.text('还没有提交记录。');
     else ui.text(await repo.value('log', '-20', '--date=short', '--format=%h  %ad  %s'));
+  } else if (choice === 5) {
+    const { historyMenu } = await import('./history.js');
+    await historyMenu(ui, repo.directory);
   }
-}
-
-export async function branches(ui: Console, directory: string): Promise<void> {
-  const { branchesMenu } = await import('./branches.js');
-  await branchesMenu(ui, directory);
 }

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { fixtureClient, prs, context, result, prData, GitError } from './github-support.mjs';
+import { fixtureClient, prs, context, result, prData, Git, GitError } from './github-support.mjs';
 
 test('PR list uses explicit target, pagination and allowlisted native projection', async () => {
   const f = fixtureClient({ handler: () => result([prData()]) });
@@ -33,11 +33,13 @@ test('PR comments, all review kinds, close and reopen have explicit actor and re
   assert.deepEqual(writes.map(call => call.body), [{ body: 'body\nline' }, { body: 'review', event: 'APPROVE' }, { body: 'review', event: 'REQUEST_CHANGES' }, { body: 'review', event: 'COMMENT' }, { state: 'closed' }, { state: 'open' }]);
   assert.ok(writes.slice(-2).every(call => call.args[5] === 'repos/acme/demo/pulls/7'));
 });
-test('merge enforces chosen strategy and checks GitHub merged:true', async () => {
+test('merge enforces chosen strategy and checks GitHub merged:true', async t => {
+  t.mock.method(Git.prototype, 'run', async () => assert.fail('server PR merge must never invoke native Git'));
   for (const method of ['merge', 'squash', 'rebase']) {
     const f = fixtureClient({ handler: () => result({ merged: true }) });
     await prs.mergePullRequest(f.client, context, 7, method);
     assert.deepEqual(f.calls.find(call => call.args[4] === 'PUT').body, { merge_method: method });
+    assert.ok(f.calls.every(call => call.args[0] === 'api'), 'server merge must not run local Git operations');
   }
   const f = fixtureClient({ handler: () => result({ merged: false }) });
   await assert.rejects(prs.mergePullRequest(f.client, context, 7, 'squash'), /未确认/u);
@@ -52,4 +54,8 @@ test('invalid PR inputs are rejected offline and unknown writes are not retried'
   const unknown = fixtureClient({ handler: () => result(undefined, 1, 'timeout fixture-secret') });
   await assert.rejects(prs.setPullRequestState(unknown.client, context, 7, 'closed'), error => /结果未知/u.test(error.message) && !error.message.includes('fixture-secret'));
   assert.equal(unknown.calls.filter(call => call.args[4] !== 'GET').length, 1);
+});
+test('PR checkout API is absent while server collaboration APIs remain available', () => {
+  assert.equal('checkoutPullRequest' in prs, false);
+  for (const name of ['listPullRequests', 'viewPullRequestFull', 'createPullRequest', 'commentPullRequest', 'reviewPullRequest', 'mergePullRequest', 'setPullRequestState', 'pullRequestsMenu']) assert.equal(typeof prs[name], 'function', name);
 });

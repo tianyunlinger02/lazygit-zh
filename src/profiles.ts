@@ -7,6 +7,9 @@ import { folderHelp } from './preferences.js';
 import { Git, GitError } from './git.js';
 import { runProcess, which } from './process.js';
 import { Cancelled, type Console } from './ui.js';
+import { currentSession, requireSession } from './session.js';
+import { managedKeyMarker, parsePrivateKey } from './managed-keys.js';
+import { configureHttps } from './credentials.js';
 import {
   MISSING, checkedPath, exactKeys, isErrno, location, mkdirPrivate, readJson, record,
   setMode, text, withStoreLock, writeJson,
@@ -86,13 +89,21 @@ function profileKeyArgs(profile: Profile, storeDirectory: string, whichFn: (prog
     if (target.host.sshUser) args.push('-l', target.host.sshUser);
     return args;
   }
-  const privateKey = checkedPath(profile.private_key, 'file');
+  const privateKey = checkedPath(currentSession() ? profile.public_key : profile.private_key, 'file');
   const expectedParent = path.join(storeDirectory, 'profiles', id(profile.profile_id));
   if (path.dirname(privateKey) !== expectedParent) throw new GitError('私钥不在该账号的托管目录。');
   const known = checkedPath(path.join(storeDirectory, 'known_hosts'), 'file');
   const ssh = programPath('ssh', profile.ssh_program, whichFn);
   const values = [ssh, privateKey, known].map((value) => process.platform === 'win32' ? value.replaceAll('\\', '/') : value);
-  const args = [values[0], '-F', 'none', '-i', values[1], '-o', 'IdentitiesOnly=yes', '-o', `UserKnownHostsFile="${values[2]}"`, '-o', 'GlobalKnownHostsFile=none', '-o', 'StrictHostKeyChecking=ask'];
+  const args = [values[0], '-F', 'none', '-i', values[1]];
+  const session = currentSession();
+  if (session) {
+    if (path.resolve(session.vault.directory) !== path.resolve(storeDirectory)) throw new GitError('此账号不属于当前解锁的凭据库。');
+    const endpoint = session.agentEndpoint(profile.profile_id);
+    if (!endpoint) throw new GitError('此账号的本次 SSH 会话尚未解锁。');
+    args.push('-o', `IdentityAgent="${endpoint.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`);
+  }
+  args.push('-o', 'IdentitiesOnly=yes', '-o', `UserKnownHostsFile="${values[2]}"`, '-o', 'GlobalKnownHostsFile=none', '-o', 'StrictHostKeyChecking=ask');
   if (target.host.sshPort !== undefined) args.push('-p', String(target.host.sshPort));
   if (target.host.sshUser) args.push('-l', target.host.sshUser);
   return args;
@@ -130,6 +141,8 @@ function checkEnvironment(): void {
 async function validateSsh(profileValue: Profile, directory: string, runner: ProcessRunner, whichFn: (program: string) => string | undefined, target: TransportTarget = DEFAULT_TRANSPORT): Promise<void> {
   validateTransport(target);
   if (target.mode !== 'managed-ssh') return;
+  const profile = asProfile(profileValue);
+  if (currentSession()) await requireSession().sshAgent(profile.profile_id);
   const args = buildSshArgs(profileValue, directory, whichFn, target);
   const result = await runner(args[0], args.slice(1).concat(['-G', `${target.host.sshUser ?? 'git'}@${target.host.sshHost}`]), { cwd: directory, interactive: false, check: false });
   const settings = new Map<string, string[]>();
@@ -148,11 +161,14 @@ async function validateSsh(profileValue: Profile, directory: string, runner: Pro
   if (!okay) throw new GitError('SSH 不支持单密钥、独立 known_hosts 和严格主机校验的受控模式；请使用兼容 OpenSSH。');
 }
 
-export async function profileGit(directory: string, profileValue: Profile, transport?: TransportTarget): Promise<Git> {
+export async function profileGit(directory: string, profileValue: Profile, transport?: TransportTarget, url?: string): Promise<Git> {
   checkEnvironment();
   const profile = asProfile(profileValue);
   const storeDirectory = path.dirname(path.dirname(path.dirname(profile.private_key)));
+  const session = currentSession();
+  if (session && rootKey(session.vault.directory) !== rootKey(storeDirectory)) throw new GitError('此账号不属于当前解锁的凭据库。');
   const target = transport ? validateTransport(transport) : (await new HostStore(storeDirectory).get(directory)) ?? DEFAULT_TRANSPORT;
+  if (session && target.mode === 'managed-ssh') await session.sshAgent(profile.profile_id);
   await validateSsh(profile, storeDirectory, runProcess as unknown as ProcessRunner, which, target);
   const config: Record<string, string> = {
     'user.name': safeText(profile.name), 'user.email': safeText(profile.email),
@@ -167,7 +183,9 @@ export async function profileGit(directory: string, profileValue: Profile, trans
   }
   const env: Record<string, undefined> = {};
   for (const key of IDENTITY_ENV) env[key] = undefined;
-  return new Git(directory, { config, env, rejectEnv: REJECT_ENV });
+  const git = new Git(directory, { config, env, rejectEnv: REJECT_ENV });
+  if (!session || target.credentials === 'external') return git;
+  return target.mode === 'https' ? configureHttps(git, profile, { host: target.host, url }) : withoutExternalCredentials(git);
 }
 
 export class ProfileStore {
@@ -275,6 +293,7 @@ export class ProfileStore {
   }
   async create(ui: Console, label: string, name: string, email: string, githubLogin: string, options: { source?: string; ssh_program?: string; sshProgram?: string; remember_auth?: boolean; rememberAuth?: boolean } = {}): Promise<Profile | undefined> {
     for (const value of [label, name, email, githubLogin]) safeText(value);
+    if (currentSession()) return this.createEncrypted(ui, label, name, email, githubLogin, options.source);
     const remember = options.remember_auth ?? options.rememberAuth ?? false;
     if (typeof remember !== 'boolean' || !LOGIN.test(githubLogin)) throw new GitError('记住认证标志或 GitHub 登录名无效。');
     const sshProgram = options.ssh_program ?? options.sshProgram ?? '';
@@ -326,6 +345,31 @@ export class ProfileStore {
       await writeJson(path.join(folder, 'profile.json'), this.encode_profile(profile));
       return profile;
     });
+  }
+  private async createEncrypted(ui: Console, label: string, name: string, email: string, githubLogin: string, source?: string): Promise<Profile | undefined> {
+    const session = requireSession();
+    if (path.resolve(session.vault.directory) !== path.resolve(this.directory) || !LOGIN.test(githubLogin)) throw new GitError('账号身份或解锁的资料目录不匹配。');
+    if (source?.toLowerCase().endsWith('.pub')) throw new GitError('导入源必须是私钥，不能是 .pub 文件。');
+    ui.text('私钥将在内存中生成/导入并加密保存；本次登录后复用，不生成免口令明文副本。');
+    if (!(await ui.routineConfirm(source ? '确认将这把私钥加密导入 AutoGit？外部原件保持不变。' : '确认生成并加密保存新 Ed25519 密钥？'))) return undefined;
+    const existing = await this.list(); const compare = process.platform === 'win32' ? label.toLowerCase() : label;
+    if (existing.some((profile) => (process.platform === 'win32' ? profile.label.toLowerCase() : profile.label) === compare)) throw new GitError('账号标签重复。');
+    const profileId = crypto.randomBytes(16).toString('hex'); const folder = path.join(this.profiles_dir, profileId);
+    const parsed = await parsePrivateKey(ui, source);
+    try {
+      await session.storeSsh(profileId, parsed.privateKey);
+      return await withStoreLock(this.directory, async () => {
+        if ((await this.list()).some((profile) => (process.platform === 'win32' ? profile.label.toLowerCase() : profile.label) === compare)) throw new GitError('账号标签重复。');
+        await mkdirPrivate(this.profiles_dir); await fsp.mkdir(folder, { mode: 0o700 });
+        const privateKey = path.join(folder, 'id_ed25519'); const publicKey = `${privateKey}.pub`;
+        await fsp.writeFile(privateKey, managedKeyMarker(profileId), { flag: 'wx', mode: 0o600 });
+        await fsp.writeFile(publicKey, parsed.publicKey, { flag: 'wx', mode: 0o600 });
+        const known = path.join(this.directory, 'known_hosts'); checkedPath(known, 'file', { missing: true });
+        try { await fsp.writeFile(known, '', { flag: 'wx', mode: 0o600 }); } catch (error) { if (!isErrno(error, 'EEXIST')) throw error; }
+        const profile = new Profile({ profile_id: profileId, label, name, email, github_login: githubLogin, private_key: privateKey, public_key: publicKey, remember_auth: true });
+        await writeJson(path.join(folder, 'profile.json'), this.encode_profile(profile)); return profile;
+      });
+    } finally { parsed.privateKey.fill(0); }
   }
   async bind(directory: string, profileId: string, transport?: TransportTarget): Promise<Profile> {
     const root = rootKey(await new Git(directory).root());
@@ -386,6 +430,11 @@ export class ProfileStore {
     });
   }
   async change_auth(ui: Console, profileId: string, remember: boolean): Promise<Profile | undefined> {
+    if (currentSession()) {
+      const profile = await this.load(profileId);
+      ui.text('此账号由加密凭据库统一管理；每次启动输入 AutoGit 解锁密码，不再通过移除私钥口令记住认证。');
+      return profile;
+    }
     if (typeof remember !== 'boolean') throw new GitError('记住认证标志无效。');
     if (!remember && this.runProcess === (runProcess as unknown as ProcessRunner) && !process.stdin.isTTY) throw new GitError('设置新私钥口令需要原生交互终端；请在真实终端运行，不要通过管道输入口令。');
     return withStoreLock(this.directory, async () => {
@@ -403,16 +452,20 @@ export class ProfileStore {
     });
   }
   async delete(ui: Console, profileId: string): Promise<boolean> {
-    return withStoreLock(this.directory, async () => {
+    let removeSecret = false;
+    const removed = await withStoreLock(this.directory, async () => {
       const profile = await this.load(profileId, false); const bindings = await this.bindings(); const roots = Object.entries(bindings).filter(([, item]) => item.profile_id === profileId).map(([root]) => root);
       const action = await ui.menu('删除账号范围', ['仅删除账号资料 / 解绑项目（保留托管密钥）', '删除账号资料和托管私钥、公钥 / 解绑项目']); if (!action) return false;
       const deleteKeys = action === 2;
       ui.text(`以下项目将解除绑定：\n${roots.join('\n') || '（无）'}\n${deleteKeys ? '将永久删除托管私钥与公钥。' : '保留托管密钥，不删除磁盘密钥文件。'}外部原件永不删除。`);
       if (!(await ui.confirm(`最终确认：删除 ${profile.label} 的${deleteKeys ? '资料及托管密钥' : '资料'}并解除以上绑定？`))) return false;
       await this.saveBindings(Object.fromEntries(Object.entries(bindings).filter(([root]) => !roots.includes(root))));
+      removeSecret = deleteKeys;
       if (deleteKeys) for (const key of [profile.private_key, profile.public_key]) { checkedPath(key, 'file', { missing: true }); await fsp.unlink(key).catch((error: unknown) => { if (!isErrno(error, 'ENOENT')) throw error; }); }
       await fsp.unlink(path.join(this.profiles_dir, profileId, 'profile.json')); return true;
     });
+    if (removed && removeSecret && currentSession()) await requireSession().removeSsh(profileId);
+    return removed;
   }
 }
 
@@ -424,15 +477,23 @@ export async function bindProject(directory: string, profileValue: Profile): Pro
   const profile = asProfile(profileValue); const store = new ProfileStore(); const loaded = await store.load(profile.profile_id); if (!isDeepStrictEqual(store.snapshot(loaded), store.snapshot(profile))) throw new GitError('账号已变化，请重新选择。'); return store.bind(directory, profile.profile_id);
 }
 export async function resolveBinding(directory: string, store = new ProfileStore()): Promise<Profile | undefined> { return store.resolve_binding(directory); }
+function withoutExternalCredentials(git: Git): Git {
+  return git.configuredOrdered([['credential.helper', ''], ['core.askPass', ''], ['credential.interactive', 'false'], ['http.extraHeader', ''], ['http.followRedirects', 'false']], {
+    env: { GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: null }, rejectEnv: ['GIT_ASKPASS', 'GIT_TRACE_CURL', 'GIT_CURL_VERBOSE', 'GCM_TRACE', 'GCM_TRACE_SECRETS'],
+  });
+}
 export async function boundGit(directory: string): Promise<Git> {
   const profile = await resolveBinding(directory); if (profile) return profileGit(directory, profile);
-  const target = await resolveTransport(directory); return target ? new Git(directory, { config: transportGitConfig(target) }) : new Git(directory);
+  const target = await resolveTransport(directory);
+  const git = target ? new Git(directory, { config: transportGitConfig(target) }) : new Git(directory);
+  return currentSession() && target?.credentials !== 'external' ? withoutExternalCredentials(git) : git;
 }
 export async function testProfile(ui: Console, directory: string, profileValue: Profile, options: ProfileStoreOptions = {}): Promise<'verified' | 'unverified'> {
   checkEnvironment(); const profile = asProfile(profileValue); const storeDirectory = path.dirname(path.dirname(path.dirname(profile.private_key))); const runner = options.runProcess ?? (runProcess as unknown as ProcessRunner);
   const target = options.transport ?? (await new HostStore(storeDirectory).get(directory)) ?? DEFAULT_TRANSPORT;
   validateTransport(target);
   if (target.mode === 'https') { ui.text('HTTPS 模式请通过仓库获取/推送验证外部凭据；不执行 SSH 测试。'); return 'unverified'; }
+  if (currentSession() && target.mode === 'managed-ssh') await requireSession().sshAgent(profile.profile_id);
   const args = buildSshArgs(profile, storeDirectory, options.which ?? which, target);
   const endpoint = target.mode === 'native-ssh' ? target.host.sshAlias ?? target.host.sshHost : target.host.sshHost;
   ui.text(`连接 ${endpoint}；${target.mode === 'managed-ssh' ? '主机指纹保存在软件 data/known_hosts' : '沿用现有 SSH config、代理、跳板与 known_hosts'}；不自动接受主机密钥。`);
@@ -452,7 +513,7 @@ export async function profilesMenu(ui: Console, directory: string): Promise<void
     const choice = await ui.menu('AutoGit 账号管理', ['新建账号 / 生成密钥', '导入已有私钥', '列出 / 查看账号', '绑定当前项目', '解绑当前项目', '测试当前绑定', '删除账号', '编辑账号署名 / 标签 / 预期登录名', '记住认证 / 更改私钥口令', '文件夹保管 / 泄露撤销帮助']); if (!choice) return;
     try {
       if (choice === 1 || choice === 2) {
-        const remember = await ui.confirm('记住认证（推荐）？使用无口令私钥，需保管好软件文件夹；不记住则由原生工具处理口令。', true);
+        const remember = currentSession() ? true : await ui.confirm('记住认证（推荐）？使用无口令私钥，需保管好软件文件夹；不记住则由原生工具处理口令。', true);
         const values = [await ui.ask('标签'), await ui.ask('提交姓名'), await ui.ask('提交邮箱'), await ui.ask('GitHub 登录名')];
         const source = choice === 2 ? await ui.ask('已有私钥的绝对路径') : undefined; const profile = await store.create(ui, values[0], values[1], values[2], values[3], { source, remember_auth: remember });
         if (profile) { ui.text(`已保存账号 ${profile.label}。`); await displayPublicKey(ui, profile.public_key); }
@@ -469,7 +530,10 @@ export async function profilesMenu(ui: Console, directory: string): Promise<void
         else if (choice === 4 && await ui.routineConfirm(`将当前项目绑定到 ${profile.label}？`)) await store.bind(directory, profile.profile_id);
         else if (choice === 7) await store.delete(ui, profile.profile_id);
         else if (choice === 8) await store.edit(ui, profile.profile_id);
-        else if (choice === 9) { const auth = await ui.menu('更改私钥口令', ['记住认证（移除托管副本口令）', '取消记住 / 原生设置新口令（可能仍为空）']); if (auth) await store.change_auth(ui, profile.profile_id, auth === 1); }
+        else if (choice === 9) {
+          if (currentSession()) ui.text('此账号的托管私钥已纳入加密库，每次启动通过独立 AutoGit 密码解锁；无需移除私钥口令。可在“使用设置”修改解锁密码，忘记密码则使用离线恢复码。');
+          else { const auth = await ui.menu('更改私钥口令', ['记住认证（移除托管副本口令）', '取消记住 / 原生设置新口令（可能仍为空）']); if (auth) await store.change_auth(ui, profile.profile_id, auth === 1); }
+        }
       }
     } catch (error) { if (error instanceof Cancelled) ui.text('已返回，尚未确认的操作不会执行。'); else if (error instanceof Error && (error instanceof GitError || 'code' in error)) ui.text(`账号操作未完成：${error.message}`); else throw error; }
   }

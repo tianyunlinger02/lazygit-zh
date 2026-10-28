@@ -2,7 +2,10 @@ import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { activateAppDirectory, appDataDir, resolveApp } from './app-context.js';
+import { activateAppDirectory, appDataDir, prepareCredentialDirectory, resolveApp } from './app-context.js';
+import { currentSession, CredentialSession, setSession, unlockSession, hasVault, secureCredentialDirectory } from './session.js';
+import { nativeRequest } from './auth.js';
+import { isManagedKey } from './managed-keys.js';
 import { GitError } from './git.js';
 import { ProfileStore } from './profiles.js';
 import { HostStore } from './hosts.js';
@@ -11,7 +14,13 @@ import { checkedPath, exactKeys, isErrno, MISSING, mkdirPrivate, readJson, recor
 
 export interface BackupEntry { path: string; size: number; sha256: string }
 export interface BackupManifest { schema_version: 1; app_version: string; created_at: string; platform: string; directories: string[]; files: BackupEntry[] }
-export interface RestoreOptions { replace?: boolean; pathRemap?: Record<string, string>; sshProgram?: 'preserve' | 'system' }
+export interface RestoreOptions {
+  replace?: boolean; pathRemap?: Record<string, string>; sshProgram?: 'preserve' | 'system';
+  /** Code-level console input; secrets never come from environment variables. */
+  ui?: Console;
+  /** Menu restores activate the already validated staging session without asking twice. */
+  activate?: boolean;
+}
 const MANIFEST_KEYS = ['schema_version', 'app_version', 'created_at', 'platform', 'directories', 'files'];
 function childPath(value: unknown): string {
   if (typeof value !== 'string' || !value || value.includes('\\') || value.includes(':') || /[\x00-\x1f\x7f-\x9f]/u.test(value) || value.split('/').some((part) => !part || part === '.' || part === '..') || path.posix.isAbsolute(value)) throw new GitError('备份路径无效或越界。');
@@ -20,6 +29,9 @@ function childPath(value: unknown): string {
 function contains(parent: string, child: string): boolean { const relative = path.relative(parent, child); return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative)); }
 function separate(a: string, b: string): void { if (contains(a, b) || contains(b, a)) throw new GitError('源与目标不能相同、嵌套或互为父目录。'); }
 async function exists(value: string): Promise<boolean> { try { await fsp.lstat(value); return true; } catch (error) { if (isErrno(error, 'ENOENT')) return false; throw error; } }
+async function protectCreatedDirectory(directory: string): Promise<void> {
+  if (process.platform === 'win32') await nativeRequest('secure-path', { path: directory, directory: true });
+}
 async function directoryTree(root: string, skipLock = false): Promise<{ directories: string[]; files: string[] }> {
   checkedPath(root, 'dir'); const directories: string[] = []; const files: string[] = [];
   const visit = async (relative: string): Promise<void> => {
@@ -75,8 +87,12 @@ export async function validateBackup(directory: string): Promise<BackupManifest>
 }
 async function snapshotLocked(source: string, destination: string): Promise<BackupManifest> {
   checkedPath(destination, 'dir', { missing: true }); if (await exists(destination)) throw new GitError('备份目标已存在；不会覆盖。');
-  const tree = await directoryTree(source, true); await mkdirPrivate(path.dirname(destination)); await fsp.mkdir(destination, { mode: 0o700 });
-  const filesRoot = path.join(destination, 'files'); await fsp.mkdir(filesRoot, { mode: 0o700 });
+  const tree = await directoryTree(source, true);
+  if (currentSession()) {
+    for (const profile of await new ProfileStore(source).list()) if (!await isManagedKey(profile.private_key)) throw new GitError('仍有未加密的旧托管私钥，请先完成迁移再备份。');
+  }
+  await mkdirPrivate(path.dirname(destination)); await fsp.mkdir(destination, { mode: 0o700 }); await protectCreatedDirectory(destination);
+  const filesRoot = path.join(destination, 'files'); await fsp.mkdir(filesRoot, { mode: 0o700 }); await protectCreatedDirectory(filesRoot);
   const manifest: BackupManifest = { schema_version: 1, app_version: '0.5.0', created_at: new Date().toISOString(), platform: process.platform, directories: tree.directories, files: [] };
   for (const directory of tree.directories.sort((a, b) => a.split('/').length - b.split('/').length)) await mkdirPrivate(path.join(filesRoot, ...directory.split('/')));
   for (const file of tree.files) { const result = await digest(path.join(source, ...file.split('/')), path.join(filesRoot, ...file.split('/'))); manifest.files.push({ path: file, ...result }); }
@@ -136,19 +152,21 @@ async function prepareRestoredData(directory: string, options: RestoreOptions): 
   await validateStoreMetadata(directory);
   // Project paths may legitimately be missing or belong to another platform after restore.
 }
-async function install(directory: string, staged: string, replace: boolean): Promise<{ previousDataDir?: string }> {
+async function install(directory: string, staged: string, replace: boolean, onInstalled?: () => Promise<void>): Promise<{ previousDataDir?: string }> {
   checkedPath(directory, 'dir', { missing: true }); const existed = await exists(directory);
   if (existed && !replace) throw new GitError('目标 data 已存在；请选择新位置，或明确选择替换。');
   let previousDataDir: string | undefined;
+  if (process.platform === 'win32') await secureCredentialDirectory(directory);
   await withStoreLock(directory, async () => {
     const existing = (await fsp.readdir(directory)).filter((entry) => entry !== '.lock');
     if (existing.length && !replace) throw new GitError('目标在操作期间已出现资料；未覆盖。');
     await directoryTree(directory, true);
-    if (existing.length) { previousDataDir = path.join(path.dirname(directory), `data-before-restore-${randomUUID()}`); await fsp.mkdir(previousDataDir, { mode: 0o700 }); }
+    if (existing.length) { previousDataDir = path.join(path.dirname(directory), `data-before-restore-${randomUUID()}`); await fsp.mkdir(previousDataDir, { mode: 0o700 }); await protectCreatedDirectory(previousDataDir); }
     const installed: string[] = []; const saved: string[] = [];
     try {
       for (const entry of existing) { await fsp.rename(path.join(directory, entry), path.join(previousDataDir!, entry)); saved.push(entry); }
       for (const entry of await fsp.readdir(staged)) { await fsp.rename(path.join(staged, entry), path.join(directory, entry)); installed.push(entry); }
+      await onInstalled?.();
     } catch (error) {
       for (const entry of installed.reverse()) await fsp.rename(path.join(directory, entry), path.join(staged, entry));
       for (const entry of saved.reverse()) await fsp.rename(path.join(previousDataDir!, entry), path.join(directory, entry));
@@ -158,17 +176,60 @@ async function install(directory: string, staged: string, replace: boolean): Pro
   return previousDataDir ? { previousDataDir } : {};
 }
 async function materialize(backup: string, destination: string, manifest: BackupManifest): Promise<void> {
-  await fsp.mkdir(destination, { mode: 0o700 });
-  for (const directory of [...manifest.directories].sort((a, b) => a.split('/').length - b.split('/').length)) await mkdirPrivate(path.join(destination, ...directory.split('/')));
-  for (const entry of manifest.files) { const actual = await digest(path.join(backup, 'files', ...entry.path.split('/')), path.join(destination, ...entry.path.split('/'))); if (actual.size !== entry.size || actual.sha256 !== entry.sha256) throw new GitError('复制恢复数据时校验失败。'); }
+  await fsp.mkdir(destination, { mode: 0o700 }); await protectCreatedDirectory(destination);
+  for (const directory of [...manifest.directories].sort((a, b) => a.split('/').length - b.split('/').length)) {
+    const target = path.join(destination, ...directory.split('/')); await mkdirPrivate(target); await protectCreatedDirectory(target);
+  }
+  for (const entry of manifest.files) {
+    const target = path.join(destination, ...entry.path.split('/'));
+    const actual = await digest(path.join(backup, 'files', ...entry.path.split('/')), target);
+    if (process.platform === 'win32') await nativeRequest('secure-path', { path: target, directory: false });
+    if (actual.size !== entry.size || actual.sha256 !== entry.sha256) throw new GitError('复制恢复数据时校验失败。');
+  }
   await verifyFiles(destination, manifest);
 }
-export async function restoreBackup(backupValue: string, dataDirectoryValue: string, options: RestoreOptions = {}): Promise<{ previousDataDir?: string }> {
+export async function restoreBackup(backupValue: string, dataDirectoryValue: string, options: RestoreOptions = {}): Promise<{ previousDataDir?: string; activated?: { persisted: boolean; dataDir: string } }> {
   const backup = checkedPath(backupValue, 'dir'); const dataDirectory = resolveApp({ dataDir: dataDirectoryValue }).dataDir; separate(backup, dataDirectory);
   const manifest = await validateBackup(backup); if (await exists(dataDirectory) && !options.replace) throw new GitError('目标 data 已存在；必须明确选择替换。');
+  const previous = currentSession();
+  if (previous?.closed) throw new GitError('凭据会话已经锁定，不能继续恢复资料。');
+  if (options.activate && path.basename(dataDirectory) !== 'data') throw new GitError('启用恢复资料时目标必须是软件根目录下的 data。');
   await mkdirPrivate(path.dirname(dataDirectory)); const staged = path.join(path.dirname(dataDirectory), `.autogit-restore-${randomUUID()}`);
-  try { await materialize(backup, staged, manifest); await prepareRestoredData(staged, options); return await install(dataDirectory, staged, !!options.replace); }
-  finally { if (await exists(staged)) { await directoryTree(staged); await fsp.rm(staged, { recursive: true }); } }
+  let prepared: CredentialSession | undefined;
+  let activated: { persisted: boolean; dataDir: string } | undefined;
+  try {
+    await materialize(backup, staged, manifest); await prepareRestoredData(staged, options);
+    if (previous || options.ui) {
+      try {
+        if (options.ui) {
+          // The restored Vault has its own password; never reuse the active Vault's password.
+          const encrypted = await hasVault(staged);
+          if (!encrypted && !await options.ui.confirm('此备份没有加密凭据库。设置独立 AutoGit 密码并迁移旧资料后恢复？旧备份不会改变。')) throw new Cancelled('未迁移旧版备份');
+          prepared = await unlockSession(options.ui, staged, { allowCreate: !encrypted });
+        } else {
+          // A pre-unlocked session may verify its own copy, never an unrelated vault.
+          prepared = new CredentialSession(await previous!.vault.atDirectory(staged));
+        }
+        await prepareCredentialDirectory(options.ui, prepared);
+      } finally { setSession(previous && !previous.closed ? previous : undefined); }
+    } else if (await hasVault(staged)) {
+      throw new GitError('恢复独立加密库必须通过交互输入其 AutoGit 密码，或提供同一已解锁会话；未替换目标。');
+    }
+    const onInstalled = async (): Promise<void> => {
+      if (options.activate) {
+        activated = await activateAppDirectory(path.dirname(dataDirectory), { ui: options.ui, session: prepared });
+      } else if (prepared && previous && path.resolve(previous.vault.directory) === path.resolve(dataDirectory)) {
+        const replacement = new CredentialSession(await prepared.vault.atDirectory(dataDirectory));
+        try { await prepareCredentialDirectory(options.ui, replacement); await previous.close(); setSession(replacement); }
+        catch (error) { try { await replacement.close(); } finally { setSession(!previous.closed ? previous : undefined); } throw error; }
+      }
+    };
+    const result = await install(dataDirectory, staged, !!options.replace, onInstalled);
+    return activated ? { ...result, activated } : result;
+  } finally {
+    await prepared?.close();
+    if (await exists(staged)) { await directoryTree(staged); await fsp.rm(staged, { recursive: true }); }
+  }
 }
 export async function relocateData(nextRootValue: string, options: { deleteSource?: boolean } = {}): Promise<{ persisted: boolean; dataDir: string }> {
   const source = appDataDir(); const resolved = resolveApp({ appDir: nextRootValue }); const root = resolved.appRoot; const destination = resolved.dataDir; separate(source, destination);
@@ -199,17 +260,21 @@ async function remapPrompts(ui: Console, backup: string): Promise<Record<string,
   return mappings;
 }
 export async function backupMenu(ui: Console): Promise<void> {
+  const protectedSession = !!currentSession();
   for (;;) {
-    const choice = await ui.menu('资料备份 / 恢复 / 迁移', ['备份全部 AutoGit data（含托管密钥）', '校验已有备份', '恢复备份到新位置 / 明确替换', '迁移资料（复制→校验→切换位置）']); if (!choice) return;
+    if (protectedSession && (!currentSession() || currentSession()!.closed)) throw new Cancelled('凭据会话已锁定，请重新启动并登录');
+    const choice = await ui.menu('资料备份 / 恢复 / 迁移', ['备份全部 AutoGit data（含托管密钥）', '校验已有备份', '恢复备份到新位置 / 明确替换', '迁移资料（复制→校验→切换位置）']);
+    if (protectedSession && (!currentSession() || currentSession()!.closed)) throw new Cancelled('凭据会话已锁定，请重新启动并登录');
+    if (!choice) return;
     try {
-      if (choice === 1) { ui.text('备份包含全部 AutoGit data 和托管私钥；不包含外部 gh 令牌和 location 指针。备份不是加密文件，请妥善保管。'); const target = await ui.ask('新备份目录绝对路径（必须不存在）'); const manifest = await createBackup(target); ui.text(`已校验备份：${manifest.files.length} 个文件。`); }
+      if (choice === 1) { ui.text(currentSession() ? '备份包含密文凭据库、公钥和普通元数据；不含恢复码、AutoGit 解锁密码或会话密钥。外部工具管理的凭据不在备份中。' : '旧版备份包含全部 AutoGit data 和托管私钥；不包含外部 gh 令牌和 location 指针。备份不是加密文件，请妥善保管。'); const target = await ui.ask('新备份目录绝对路径（必须不存在）'); const manifest = await createBackup(target); ui.text(`已校验备份：${manifest.files.length} 个文件。`); }
       else if (choice === 2) { const manifest = await validateBackup(await ui.ask('备份目录绝对路径')); ui.text(`SHA-256、路径和版本校验通过：${manifest.files.length} 个文件。`); }
       else if (choice === 3) {
         const backup = await ui.ask('备份目录绝对路径'); await validateBackup(backup); const root = resolveApp({ appDir: await ui.ask('恢复到的软件根目录') }).appRoot; const data = path.join(root, 'data');
         const mappings = await remapPrompts(ui, backup); const ssh = await ui.menu('跨机 SSH 程序', ['改用当前系统 SSH（清除旧自定义程序绝对路径）', '保留备份的自定义 SSH 程序路径']); if (!ssh) continue;
         const replace = await exists(data); ui.text(`恢复目标：${data}${replace ? '（已存在，将替换；原资料保留在旁边的 data-before-restore-*）' : '（新位置）'}`);
         if (!await ui.confirm(replace ? '最终确认：替换目标 data 的全部现有资料？' : '确认恢复备份到这个新位置并切换？')) continue;
-        const result = await restoreBackup(backup, data, { replace, pathRemap: mappings, sshProgram: ssh === 1 ? 'system' : 'preserve' }); const activated = await activateAppDirectory(root);
+        const result = await restoreBackup(backup, data, { replace, pathRemap: mappings, sshProgram: ssh === 1 ? 'system' : 'preserve', ui, activate: true }); const activated = result.activated!;
         ui.text(`已恢复并切换到 ${data}。${result.previousDataDir ? `原资料保留：${result.previousDataDir}` : ''}`);
         if (!activated.persisted) ui.text(`显式目录启动：下次请使用 --app-dir ${JSON.stringify(root)}，未改位置指针。`);
       } else if (choice === 4) {

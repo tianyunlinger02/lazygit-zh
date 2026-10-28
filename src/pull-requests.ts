@@ -1,11 +1,7 @@
-/** Pull request workflows: gh API metadata plus profile-bound native Git checkout. */
-import { GithubClient, inputText, objectResponse, positiveNumber, repositoryContext, repositoryPath, safeDisplay, textField, type RepositoryContext } from './github.js';
-import { GitError, type Git } from './git.js';
-import { repositoryStamp, verifyRepositoryStamp } from './destructive.js';
-import { worktreeRecords } from './worktrees.js';
-import { profileGit } from './profiles.js';
-import { transportUrl } from './hosts.js';
-import { githubAction, githubSession, githubTransport, transportSummary, chooseRepository, confirmGithubWrite, confirmGithubRoutine, pagedSelection, readBody, assertHost, listResponse, PAGE_SIZE, type GithubSession } from './github-repositories.js';
+/** Pull request collaboration through the GitHub API; no local checkout or branch changes. */
+import { GithubClient, inputText, objectResponse, positiveNumber, repositoryPath, safeDisplay, textField, type RepositoryContext } from './github.js';
+import { GitError } from './git.js';
+import { githubAction, githubSession, chooseRepository, confirmGithubWrite, pagedSelection, readBody, assertHost, listResponse, PAGE_SIZE, type GithubSession } from './github-repositories.js';
 import type { Console } from './ui.js';
 
 export interface PullRequestSummary { number: number; title: string; state: string; draft: boolean; author: string; head: string; base: string; merged: boolean; }
@@ -46,71 +42,6 @@ export async function mergePullRequest(client: GithubClient, context: Repository
   if (response.merged !== true) throw new GitError('GitHub 未确认 PR 已合并；请检查冲突、分支保护和检查状态。不会自动重试。');
 }
 export async function setPullRequestState(client: GithubClient, context: RepositoryContext, number: number, state: 'open' | 'closed'): Promise<void> { assertHost(client, context); positiveNumber(number); if (!['open', 'closed'].includes(state)) throw new GitError('PR 状态无效。'); await client.writeJson('PATCH', `${repositoryPath(context)}/pulls/${number}`, { state }); }
-function branchName(number: number): string { return `autogit-pr-${positiveNumber(number)}`; }
-async function branchOID(repo: Git, branch: string): Promise<string | undefined> {
-  const result = await repo.run(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], { check: false });
-  if (result.status === 1) return undefined;
-  if (result.status || !/^[0-9a-f]{40,64}$/u.test(result.stdout.toString().trim())) throw new GitError('无法核对本地分支对象，请重新预览。');
-  return result.stdout.toString().trim();
-}
-export async function checkoutPullRequest(ui: Console, session: GithubSession, context: RepositoryContext, pr: PullRequestSummary): Promise<void> {
-  assertHost(session.client, context); positiveNumber(pr.number);
-  const projection = '{number: .number, sha: .head.sha, head: {ref: .head.ref, owner: .head.repo.owner.login, name: .head.repo.name}, base: {owner: .base.repo.owner.login, name: .base.repo.name}}';
-  const raw = await session.client.readJson(`${repositoryPath(context)}/pulls/${pr.number}`, projection);
-  const data = objectResponse(raw, ['number', 'sha', 'head', 'base']);
-  if (data.number !== pr.number || !/^[0-9a-f]{40,64}$/u.test(textField(data.sha))) throw new GitError('PR 编号或 head SHA 无效。');
-  const head = objectResponse(data.head, ['ref', 'owner', 'name']), base = objectResponse(data.base, ['owner', 'name']);
-  const headContext = repositoryContext(context.host, textField(head.owner), textField(head.name));
-  if (textField(base.owner).toLowerCase() !== context.owner.toLowerCase() || textField(base.name).toLowerCase() !== context.name.toLowerCase()) throw new GitError('PR base 仓库与选定上下文不一致。');
-  const transport = githubTransport(session, context);
-  const remote = transportUrl(`${headContext.owner}/${headContext.name}`, transport), ref = `refs/heads/${textField(head.ref)}`;
-  const fetched = `refs/autogit/pull-requests/${pr.number}/${data.sha}`;
-  let repo = await (await profileGit(session.directory, session.profile, transport)).repository();
-  await repo.ensureReady();
-  const originalBranch = await repo.branch(), originalOID = await branchOID(repo, originalBranch), stamp = await repositoryStamp(repo);
-  let branch = branchName(pr.number), mode: 'create' | 'switch' | 'rebuild' = 'create', previousOID: string | undefined;
-  for (;;) {
-    if (branch.startsWith('-') || branch === 'HEAD' || (await repo.run(['check-ref-format', `refs/heads/${branch}`], { check: false })).status) {
-      ui.text('本地分支名称无效，请使用另一个名称。'); branch = await ui.ask('新本地分支名称', branchName(pr.number)); continue;
-    }
-    previousOID = await branchOID(repo, branch);
-    if (!previousOID) break;
-    const choice = await ui.menu(`本地分支 ${safeDisplay(branch)} 已存在 · ${previousOID}`, ['换一个本地分支名称', '仅切换已有分支（不 fetch、不更新，不保证是最新 PR）', '明确重建该分支到预览的 PR SHA（替换分支指向）']);
-    if (!choice) return;
-    if (choice === 1) { branch = await ui.ask('新本地分支名称', `${branchName(pr.number)}-new`); continue; }
-    mode = choice === 2 ? 'switch' : 'rebuild'; break;
-  }
-  const validate = async (): Promise<void> => {
-    await session.checkProfile();
-    await repo.ensureReady();
-    if (await repo.branch() !== originalBranch || await branchOID(repo, originalBranch) !== originalOID) throw new GitError('当前分支或其对象在预览后改变，请重新预览。');
-    await verifyRepositoryStamp(repo, stamp);
-    if ((await repo.run(['check-ref-format', ref], { check: false })).status) throw new GitError('PR head 分支无效。');
-    if (await branchOID(repo, branch) !== previousOID) throw new GitError('目标本地分支在预览后改变或出现，请重新选择。');
-    if ((await worktreeRecords(repo)).some((item) => item.branch === `refs/heads/${branch}` && item.path !== repo.directory)) throw new GitError('目标分支被其他 worktree 占用；不会切换、重建或绕过 Git 保护。');
-    if ((await repo.value('ls-remote', '--get-url', remote)).toLowerCase() !== remote.toLowerCase()) throw new GitError('Git URL 重写改变了 PR fetch 目标，已停止。');
-  };
-  const verifyMetadata = async (): Promise<void> => {
-    if (JSON.stringify(await session.client.readJson(`${repositoryPath(context)}/pulls/${pr.number}`, projection)) !== JSON.stringify(raw)) throw new GitError('确认期间 PR head 或归属改变，请重新预览。');
-  };
-  await validate();
-  const details = `PR #${pr.number}\n来源：${remote}\n传输：${transportSummary(transport)}\nhead：${ref}\n预览 PR SHA：${data.sha}\n本地分支：${branch}\n${mode === 'switch' ? `仅切换已有分支，OID：${previousOID}；不 fetch、不更新，不保证是最新 PR。` : mode === 'rebuild' ? `明确重建分支指向：\n旧 OID：${previousOID}\n新 OID：${data.sha}\n旧分支独有提交可能失去分支引用；不自动备份、不 stash、不丢弃本地修改。` : '新建本地分支；Git 可保留的本地修改随切换保留，有覆盖冲突时停止。'}\n不会 push、fork、添加 remote 或设置上游。`;
-  if (!await (mode === 'rebuild' ? confirmGithubWrite(ui, session, context, '明确重建本地 PR 分支', details, { scope: 'local' }) : confirmGithubRoutine(ui, session, context, mode === 'switch' ? '仅切换已有本地 PR 分支（不更新）' : 'fetch 并 checkout PR', details))) return;
-  if (mode !== 'switch') await session.client.ensureActor();
-  await verifyMetadata();
-  repo = await (await profileGit(session.directory, session.profile, transport)).repository(); await validate();
-  if (mode !== 'switch') {
-    await repo.run(['fetch', '--no-tags', '--no-write-fetch-head', '--', remote, `${ref}:${fetched}`], { interactive: true });
-    if (await repo.value('rev-parse', '--verify', fetched) !== data.sha) throw new GitError('获取的 PR SHA 与预览不一致；已获取的 ref 保留，不会切换或自动回滚。');
-    await verifyMetadata();
-  }
-  await validate();
-  await repo.run(mode === 'switch' ? ['switch', '--no-overwrite-ignore', '--', branch] : ['switch', '--no-overwrite-ignore', '--no-track', mode === 'rebuild' ? '--force-create' : '--create', branch, textField(data.sha)], { interactive: true });
-  const expectedOID = mode === 'switch' ? previousOID : data.sha;
-  if (await repo.branch() !== branch || await branchOID(repo, branch) !== expectedOID || await repo.value('rev-parse', '--verify', 'HEAD') !== expectedOID) throw new GitError('切换已执行，但分支或对象随后改变；请只读核对，不会自动回滚。');
-  await session.checkProfile();
-  ui.text(mode === 'switch' ? `已仅切换到已有本地分支 ${branch}（${previousOID}）；未 fetch、未更新，不保证是最新 PR。` : `已切换到本地分支 ${branch}（${data.sha}）；未设置 upstream 或 push。`);
-}
 async function choosePr(ui: Console, session: GithubSession, context: RepositoryContext): Promise<PullRequestSummary | undefined> {
   const state = (await ui.menu('PR 状态', ['open', 'closed', 'all', '直接输入编号'])); if (!state) return undefined;
   if (state === 4) {
@@ -132,10 +63,10 @@ export async function pullRequestsMenu(ui: Console, directory: string): Promise<
   const session = await githubSession(ui, directory); if (!session) return;
   const selected = await chooseRepository(ui, session); if (!selected) return; let context: RepositoryContext = selected;
   for (;;) {
-    const choice = await ui.menu(`Pull requests · ${context.owner}/${context.name}`, ['列出 PR', '查看 PR', '创建 PR', 'checkout PR（原生 Git + 明确传输模式）', '评论 PR', 'review：approve / request-changes / comment', '合并 PR', '关闭 PR', '重新打开 PR', '重新选择仓库']);
+    const choice = await ui.menu(`Pull requests · ${context.owner}/${context.name}`, ['列出 PR', '查看 PR', '创建 PR', '评论 PR', 'review：approve / request-changes / comment', '合并 PR（服务端）', '关闭 PR', '重新打开 PR', '重新选择仓库']);
     if (!choice) return;
     await githubAction(ui, async () => {
-      if (choice === 10) { context = await chooseRepository(ui, session) ?? context; return; }
+      if (choice === 9) { context = await chooseRepository(ui, session) ?? context; return; }
       if (choice === 1) { await pagedSelection(ui, 'Pull requests', (page) => listPullRequests(session.client, context, page), (pr) => `#${pr.number} ${pr.title} · ${pr.state} · ${pr.author}`); return; }
       const pr = choice === 2 || choice >= 4 ? await choosePr(ui, session, context) : undefined;
       if (choice === 2) {
@@ -152,11 +83,10 @@ export async function pullRequestsMenu(ui: Console, directory: string): Promise<
         return;
       }
       if (!pr) return;
-      if (choice === 4) { await checkoutPullRequest(ui, session, context, pr); return; }
-      if (choice === 5) { const body = await readBody(ui); if (await confirmGithubWrite(ui, session, context, '评论 PR', `PR #${pr.number}\n正文：\n${body}`)) await commentPullRequest(session.client, context, pr.number, body); return; }
-      if (choice === 6) { const eventChoice = await ui.menu('review 类型', ['APPROVE', 'REQUEST_CHANGES', 'COMMENT']); if (!eventChoice) return; const body = await readBody(ui); if (await confirmGithubWrite(ui, session, context, '提交 PR review', `PR #${pr.number}\n事件：${['APPROVE', 'REQUEST_CHANGES', 'COMMENT'][eventChoice - 1]}\n正文：\n${body}`)) await reviewPullRequest(session.client, context, pr.number, ['APPROVE', 'REQUEST_CHANGES', 'COMMENT'][eventChoice - 1] as 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT', body); return; }
-      if (choice === 7) { const method = await ui.menu('合并策略', ['merge commit', 'squash', 'rebase']); if (!method) return; const title = await ui.ask('可选合并提交标题（空则默认）', '', { allowEmpty: true }); if (await confirmGithubWrite(ui, session, context, '合并 PR', `PR #${pr.number}\n策略：${['merge', 'squash', 'rebase'][method - 1]}`)) await mergePullRequest(session.client, context, pr.number, ['merge', 'squash', 'rebase'][method - 1] as 'merge' | 'squash' | 'rebase', title || undefined); return; }
-      const state = choice === 8 ? 'closed' : 'open'; if (await confirmGithubWrite(ui, session, context, state === 'closed' ? '关闭 PR' : '重新打开 PR', `PR #${pr.number}`)) await setPullRequestState(session.client, context, pr.number, state);
+      if (choice === 4) { const body = await readBody(ui); if (await confirmGithubWrite(ui, session, context, '评论 PR', `PR #${pr.number}\n正文：\n${body}`)) await commentPullRequest(session.client, context, pr.number, body); return; }
+      if (choice === 5) { const eventChoice = await ui.menu('review 类型', ['APPROVE', 'REQUEST_CHANGES', 'COMMENT']); if (!eventChoice) return; const body = await readBody(ui); if (await confirmGithubWrite(ui, session, context, '提交 PR review', `PR #${pr.number}\n事件：${['APPROVE', 'REQUEST_CHANGES', 'COMMENT'][eventChoice - 1]}\n正文：\n${body}`)) await reviewPullRequest(session.client, context, pr.number, ['APPROVE', 'REQUEST_CHANGES', 'COMMENT'][eventChoice - 1] as 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT', body); return; }
+      if (choice === 6) { const method = await ui.menu('合并策略', ['merge commit', 'squash', 'rebase']); if (!method) return; const title = await ui.ask('可选合并提交标题（空则默认）', '', { allowEmpty: true }); if (await confirmGithubWrite(ui, session, context, '合并 PR（服务端）', `PR #${pr.number}\n策略：${['merge', 'squash', 'rebase'][method - 1]}`)) await mergePullRequest(session.client, context, pr.number, ['merge', 'squash', 'rebase'][method - 1] as 'merge' | 'squash' | 'rebase', title || undefined); return; }
+      const state = choice === 7 ? 'closed' : 'open'; if (await confirmGithubWrite(ui, session, context, state === 'closed' ? '关闭 PR' : '重新打开 PR', `PR #${pr.number}`)) await setPullRequestState(session.client, context, pr.number, state);
     });
   }
 }

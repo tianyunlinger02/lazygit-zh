@@ -186,11 +186,11 @@ export async function tagsMenu(ui: Console, session: GithubSession, context: Rep
   for (;;) {
     const choice = await ui.menu('Tag / 原生 Git', ['查看本地 Tags', '创建本地 Tag（不推送）', '删除本地 Tag（不删除远程）', '推送一个明确的 Tag', '删除一个明确的远程 Tag']); if (!choice) return;
     await githubAction(ui, async () => {
-      const transport = githubTransport(session, context);
-      let repo = await (await profileGit(session.directory, session.profile, transport)).repository();
+      const transport = githubTransport(session, context), remote = transportUrl(`${context.owner}/${context.name}`, transport);
+      let repo = await (await profileGit(session.directory, session.profile, transport, remote)).repository();
       await repo.ensureReady();
       if (choice === 1) { ui.text(safeDisplay(await repo.value('tag', '--list', '--format=%(refname:short)  %(objectname:short)')) || '没有本地 Tag。'); return; }
-      const tag = await ui.ask('明确的 Tag 名称'), ref = await tagRef(repo, tag), remote = transportUrl(`${context.owner}/${context.name}`, transport);
+      const tag = await ui.ask('明确的 Tag 名称'), ref = await tagRef(repo, tag);
       let target = '', message = '';
       if (choice === 2) {
         const source = inputText(await ui.ask('Tag 指向的提交 / 分支 / SHA', 'HEAD'));
@@ -204,7 +204,7 @@ export async function tagsMenu(ui: Console, session: GithubSession, context: Rep
       const confirm = choice === 2 ? confirmGithubRoutine : choice === 3 ? (ui: Console, session: GithubSession, context: RepositoryContext, action: string, details: string) => confirmGithubWrite(ui, session, context, action, details, { scope: 'local' }) : confirmGithubWrite;
       if (!await confirm(ui, session, context, action, `本地：${repo.directory}\nTag：${ref}\n对象：${target || '远程已有 Tag'}\n${choice >= 4 ? `目标：${remote}\n传输：${transportSummary(transport)}` : '不联网、不推送；远程 Tag 不变。'}${message ? `\n说明：${message}` : ''}`)) return;
       if (choice >= 4) await session.client.ensureActor();
-      repo = await (await profileGit(session.directory, session.profile, transport)).repository(); await repo.ensureReady();
+      repo = await (await profileGit(session.directory, session.profile, transport, remote)).repository(); await repo.ensureReady();
       if (choice === 2) { if (!(await repo.run(['show-ref', '--verify', '--quiet', ref], { check: false })).status) throw new GitError('确认期间本地 Tag 已出现，拒绝覆盖。'); await repo.run(['tag', '--no-sign', ...(message ? ['--annotate', '--message', message] : []), '--', tag, target]); }
       else if (choice === 3) { if (await repo.value('rev-parse', '--verify', ref) !== target) throw new GitError('确认期间 Tag 改变，已停止。'); await repo.run(['tag', '--delete', '--', tag]); }
       else {

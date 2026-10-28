@@ -1,7 +1,15 @@
-/** Offline commit/reflog browsing and non-overwriting recovery branches. */
+/** Offline, read-only commit browsing, search, details and graphs. */
 import { Git, GitError, decodePath } from './git.js';
-import { localRepository, repositoryStamp, resolveCommit, verifyRepositoryStamp, type Directory } from './destructive.js';
+import { boundGit } from './profiles.js';
 import type { Console } from './ui.js';
+
+type Directory = string | Git;
+async function localRepository(directory: Directory): Promise<Git> { return (directory instanceof Git ? directory : await boundGit(directory)).repository(); }
+async function resolveCommit(repo: Git, value: string): Promise<string> {
+  const result = await repo.run(['rev-parse', '--verify', '--end-of-options', `${value}^{commit}`], { check: false });
+  if (result.status) throw new GitError('目标不是可用的本地提交；不会联网获取或猜测。');
+  return result.stdout.toString('ascii').trim();
+}
 
 export interface CommitEntry { readonly oid: string; readonly short: string; readonly date: string; readonly subject: string }
 function records(raw: Buffer, width: number): string[][] {
@@ -59,39 +67,8 @@ export async function historyGraph(ui: Console, directory: Directory): Promise<v
     if (!choice) return; skip = choice === 1 ? skip + 30 : Math.max(0, skip - 30);
   }
 }
-export interface ReflogEntry { readonly oid: string; readonly selector: string; readonly subject: string }
-export async function reflogPage(repo: Git, options: { skip?: number; limit?: number } = {}): Promise<ReflogEntry[]> {
-  const skip = options.skip ?? 0, limit = options.limit ?? 20;
-  if (!Number.isSafeInteger(skip) || skip < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new GitError('reflog 分页参数无效。');
-  if (!await repo.hasCommits()) return [];
-  return records((await repo.run(['reflog', 'show', `--skip=${skip}`, `--max-count=${limit}`, '--format=%H%x00%gD%x00%gs%x00', 'HEAD', '--'])).stdout, 3).map(([oid, selector, subject]) => ({ oid, selector, subject }));
-}
-export async function recoverBranch(ui: Console, directory: Directory, options: { commit?: string; name?: string } = {}): Promise<void> {
-  const repo = await localRepository(directory);
-  const oid = options.commit ? await resolveCommit(repo, options.commit) : await chooseCommit(ui, repo, '选择恢复提交'); if (!oid) return;
-  const name = options.name ?? await ui.ask('恢复用新分支名称', 'recovery');
-  if (!name || name.startsWith('-') || name === 'HEAD' || (await repo.run(['check-ref-format', `refs/heads/${name}`], { check: false })).status) throw new GitError('恢复分支名无效。');
-  if (!(await repo.run(['show-ref', '--verify', '--quiet', `refs/heads/${name}`], { check: false })).status) throw new GitError('恢复分支已存在，不会覆盖。');
-  const stamp = await repositoryStamp(repo);
-  ui.text(`恢复提交：${oid}\n新分支：${JSON.stringify(name)}\n只创建新分支，不切换，不覆盖文件，不移动当前 HEAD；reflog 可能过期。`);
-  if (!await ui.confirm('确认创建这个恢复分支？')) return;
-  await verifyRepositoryStamp(repo, stamp);
-  await repo.run(['branch', '--no-track', '--', name, oid]); ui.text('恢复分支已创建；当前工作区保持原样。');
-}
-export async function browseReflog(ui: Console, directory: Directory): Promise<void> {
-  const repo = await localRepository(directory); let skip = 0;
-  ui.text('reflog 是本地 HEAD 移动记录，不是永久备份；失去引用的提交可能被回收。');
-  for (;;) {
-    const entries = await reflogPage(repo, { skip });
-    const choice = await ui.menu(`HEAD reflog（第 ${Math.floor(skip / 20) + 1} 页，选记录恢复新分支）`, [...entries.map(entry => `${entry.selector} | ${entry.oid} | ${JSON.stringify(entry.subject)}`), '下一页', '上一页']);
-    if (!choice) return;
-    if (choice <= entries.length) { await recoverBranch(ui, repo, { commit: entries[choice - 1].oid }); return; }
-    if (choice === entries.length + 1) { if (entries.length === 20) skip += 20; else ui.text('已到最后一页。'); }
-    else skip = Math.max(0, skip - 20);
-  }
-}
 export async function historyMenu(ui: Console, directory: string): Promise<void> {
-  const actions = [browseHistory, historyGraph, browseReflog];
-  const choice = await ui.menu('历史与恢复', ['历史分页 / 搜索 / 提交详情', '本地历史图（分支、合并、远程缓存）', 'reflog 与恢复到新分支']);
+  const actions = [browseHistory, historyGraph];
+  const choice = await ui.menu('只读历史', ['历史分页 / 搜索 / 提交详情', '本地历史图（分支、合并、远程缓存）']);
   if (choice) await actions[choice - 1](ui, directory);
 }

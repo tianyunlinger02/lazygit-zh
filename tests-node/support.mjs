@@ -7,13 +7,13 @@ import { Console } from '../dist/ui.js';
 import { resetAppContextForTests } from '../dist/app-context.js';
 
 export class ScriptedConsole extends Console {
-  constructor(answers = [], { quick = false } = {}) {
+  constructor(answers = [], { quick = false, secretInput } = {}) {
     const messages = [], pending = [...answers];
     super((prompt) => {
       messages.push(prompt);
       assert.ok(pending.length, `缺少测试输入：${prompt}`);
       return pending.shift();
-    }, (message) => messages.push(message), { quick });
+    }, (message) => messages.push(message), { quick, secretInput });
     this.messages = messages;
     this.answers = pending;
   }

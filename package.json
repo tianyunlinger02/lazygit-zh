@@ -2,17 +2,19 @@
   "name": "autogit-cn",
   "version": "0.5.0",
   "private": true,
-  "description": "中文菜单式 Git 助手：账号密钥、日常提交和分支合并",
+  "description": "中文菜单式 Git 助手：下载上传、远程管理和加密账号凭据",
   "type": "module",
   "engines": { "node": ">=22" },
   "bin": { "autogit": "dist/cli.js" },
-  "files": ["dist/**/*.js", "README.md", "docs/capabilities.md"],
+  "files": ["dist/**/*.js", "native/bin/**/*", "README.md", "docs/capabilities.md"],
   "scripts": {
     "build": "node scripts/build.mjs",
+    "build:native": "node scripts/build-native.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test --test-concurrency=1 tests-node/*.test.mjs",
-    "prepack": "npm run build",
-    "verify": "node scripts/verify-release.mjs"
+    "prepack": "npm run build && npm run check:native",
+    "verify": "node scripts/verify-release.mjs",
+    "check:native": "node scripts/check-native.mjs"
   },
   "devDependencies": { "@types/node": "^22.0.0", "typescript": "^5.9.0" }
 }

@@ -1,10 +1,13 @@
 import * as crypto from 'node:crypto';
+import { lstat, mkdir, realpath, stat } from 'node:fs/promises';
 import * as path from 'node:path';
 import { appDataDir } from './app-context.js';
-import { Git, GitError } from './git.js';
-import { ProfileStore } from './profiles.js';
+import { clone, chooseDirectory } from './workflows.js';
+import { decodePath, encodePath, Git, GitError } from './git.js';
+import { credentialsMenu } from './credentials.js';
+import { profilesMenu, ProfileStore } from './profiles.js';
 import { Cancelled, type Console } from './ui.js';
-import { checkedPath, exactKeys, MISSING, readJson, record, text, withStoreLock, writeJson } from './storage.js';
+import { checkedPath, exactKeys, isErrno, MISSING, readJson, record, text, withStoreLock, writeJson } from './storage.js';
 
 export interface ProjectRecord { project_id: string; path: string; label: string; favorite: boolean; last_used: number }
 const PROJECT_KEYS = ['project_id', 'path', 'label', 'favorite', 'last_used'];
@@ -77,6 +80,128 @@ export class ProjectStore {
   async root(directory: string): Promise<string> { const root = await new Git(directory).root(); return projectPath(root); }
 }
 export async function listProjects(): Promise<ProjectRecord[]> { return new ProjectStore().list(); }
+
+async function startupDirectory(directory: string): Promise<string> {
+  if (!path.isAbsolute(directory)) throw new GitError('项目快捷路径必须是绝对路径。');
+  try {
+    if (!(await stat(encodePath(directory))).isDirectory()) throw new GitError('该路径不是文件夹。');
+    return decodePath(await realpath(encodePath(directory), { encoding: 'buffer' }));
+  } catch (error) {
+    if (isErrno(error, 'ENOENT') || isErrno(error, 'ENOTDIR')) throw new GitError('该文件夹已不存在或路径不可用。');
+    throw error;
+  }
+}
+
+function startupError(error: unknown): error is Error { return error instanceof Error && (error instanceof GitError || 'code' in error); }
+
+function outsideCredentialDirectory(directory: string): void {
+  const relative = path.relative(normalize(appDataDir()), normalize(directory));
+  if (!relative || relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) {
+    throw new GitError('不能在 AutoGit 凭据资料目录 data 内创建项目；请选择独立的项目文件夹。');
+  }
+}
+
+async function createStartupDirectory(directory: string): Promise<string> {
+  outsideCredentialDirectory(directory);
+  const parents: string[] = [];
+  let parent = path.dirname(directory);
+  for (;;) {
+    try {
+      const info = await lstat(encodePath(parent));
+      if (!info.isDirectory() || info.isSymbolicLink()) throw new GitError('项目父目录不是普通文件夹，或在选择期间发生变化。');
+      break;
+    } catch (error) {
+      if (!isErrno(error, 'ENOENT')) throw error;
+      parents.push(parent); parent = path.dirname(parent);
+    }
+  }
+  for (const next of [...parents.reverse(), directory]) {
+    outsideCredentialDirectory(next);
+    const expected = path.dirname(next);
+    if (normalize(await startupDirectory(expected)) !== normalize(expected)) throw new GitError('项目父目录在选择期间发生变化；请重新选择路径。');
+    try { await mkdir(encodePath(next)); }
+    catch (error) {
+      if (isErrno(error, 'EEXIST')) throw new GitError('该路径已存在，未覆盖或清空任何内容；请换一个新路径，或选择“打开已有本地文件夹”。');
+      throw error;
+    }
+  }
+  const created = await startupDirectory(directory);
+  if (normalize(created) !== normalize(directory)) throw new GitError('项目目录在创建期间发生变化；已创建的目录保留，请重新选择。');
+  return created;
+}
+
+async function startupDownload(ui: Console, current: string): Promise<string | undefined> {
+  for (;;) {
+    const choice = await ui.menu('下载项目与准备账号', ['下载已有远程项目', '管理账号与密钥（新建 / 导入）', '录入加密 HTTPS Token']);
+    if (!choice) return undefined;
+    if (choice === 2) await profilesMenu(ui, current);
+    else if (choice === 3) await credentialsMenu(ui, current);
+    else {
+      try { return await clone(ui, current); }
+      catch (error) {
+        if (startupError(error)) ui.text('下载未确认成功；已有文件和可能的部分下载目录会保留，不自动重试或删除。');
+        throw error;
+      }
+    }
+  }
+}
+
+/** Startup only selects a local folder; the caller owns recency and last_project persistence. */
+export async function chooseStartupProject(ui: Console, current: string, lastProject: string): Promise<string | undefined> {
+  ui.text('请选择本次要打开的项目。普通非 Git 文件夹也可以；打开或新建文件夹不会自动初始化 Git、提交或上传。');
+  for (;;) {
+    try {
+      const shortcuts: { label: string; source: string; directory: string }[] = [];
+      for (const [label, source] of [['继续上次项目', lastProject], ['使用当前目录', current]]) {
+        if (!source) continue;
+        try {
+          const directory = await startupDirectory(source);
+          if (!shortcuts.some(item => normalize(item.directory) === normalize(directory))) shortcuts.push({ label, source, directory });
+        } catch (error) {
+          if (!startupError(error)) throw error;
+          ui.text(`${label}路径不可用：${JSON.stringify(source)}；${error.message}。可选择其他文件夹，原记录保持不变。`);
+        }
+      }
+      const choice = await ui.menu('启动项目选择', [
+        ...shortcuts.map(item => `${item.label} — ${JSON.stringify(item.directory)}`),
+        '打开已有本地文件夹', '创建新的本地文件夹', '下载远程项目 / 准备账号与 Token', '最近使用 / 收藏项目',
+      ], '退出');
+      if (!choice) return undefined;
+      if (choice <= shortcuts.length) {
+        const item = shortcuts[choice - 1], directory = await startupDirectory(item.source);
+        if (normalize(directory) !== normalize(item.directory)) throw new GitError('项目路径在选择期间发生变化；请重新选择。');
+        return directory;
+      }
+      const action = choice - shortcuts.length;
+      if (action === 1) return await startupDirectory(await chooseDirectory(ui, current));
+      if (action === 2) {
+        const directory = await createStartupDirectory(await chooseDirectory(ui, current, { existing: false }));
+        ui.text(`已创建本地文件夹：${JSON.stringify(directory)}；尚未初始化 Git、提交或上传。`);
+        return directory;
+      }
+      if (action === 3) {
+        const directory = await startupDownload(ui, current);
+        if (directory !== undefined) return await startupDirectory(directory);
+        continue;
+      }
+      const records = await new ProjectStore().list();
+      if (!records.length) { ui.text('尚无最近使用或收藏项目；可以打开、新建或下载项目。'); continue; }
+      const selected = await ui.menu('选择最近 / 收藏项目', records.map(item => `${item.favorite ? '[收藏] ' : ''}${item.label} — ${JSON.stringify(item.path)}`));
+      if (!selected) continue;
+      const item = records[selected - 1];
+      try { return await startupDirectory(item.path); }
+      catch (error) {
+        if (!startupError(error)) throw error;
+        ui.text(`项目记录路径不可用：${JSON.stringify(item.path)}；${error.message}。记录未移除或更新，请重新选择。`);
+      }
+    } catch (error) {
+      if (error instanceof Cancelled) ui.text('已返回启动项目选择；未自动进入当前目录。');
+      else if (startupError(error)) ui.text(`项目选择未完成：${error.message}`);
+      else throw error;
+    }
+  }
+}
+
 export async function projectsMenu(ui: Console, directory: string): Promise<string | undefined> {
   const store = new ProjectStore();
   try { await store.touch(directory); } catch (error) { if (!(error instanceof GitError)) throw error; }

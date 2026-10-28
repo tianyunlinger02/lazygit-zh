@@ -9,6 +9,6 @@ if not exist "%~dp0dist\cli.js" (
     echo Run npm ci and npm run build in the AutoGit source directory first. 1>&2
     exit /b 1
 )
-rem Keep the caller's working directory; data lives beside this portable launcher.
-node "%~dp0dist\cli.js" --app-dir "%~dp0." %*
+rem Keep the caller's working directory; use the normal saved data location.
+node "%~dp0dist\cli.js" %*
 exit /b %errorlevel%

@@ -5,10 +5,13 @@ import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { configureApp, appDataDir, appRoot, resolveApp, changeAppDirectory, resetAppContextForTests } from '../dist/app-context.js';
+import { configureApp, commitConfiguredApp, appDataDir, appRoot, resolveApp, changeAppDirectory, activateUnlockedDirectory, resetAppContextForTests } from '../dist/app-context.js';
 import { loadPreferences, savePreferences, startup, settingsMenu, DEFAULTS } from '../dist/preferences.js';
 import { GitError } from '../dist/git.js';
 import { fixture, ScriptedConsole } from './support.mjs';
+import { Vault, VaultUnlockError } from '../dist/vault.js';
+import { CredentialSession, currentSession, setSession } from '../dist/session.js';
+import { Cancelled } from '../dist/ui.js';
 
 function noOverrides() { delete process.env.AUTOGIT_DATA_DIR; resetAppContextForTests(); }
 function pointer(f) { return process.platform === 'win32' ? join(process.env.APPDATA, 'AutoGit', 'location.json') : join(process.env.XDG_CONFIG_HOME, 'autogit', 'location.json'); }
@@ -87,9 +90,83 @@ test('corrupt and unknown preferences never get silently replaced; lock collisio
   await fs.writeFile(file, JSON.stringify(DEFAULTS)); await assert.rejects(savePreferences({ token: 'must not persist' }), /未知/u); const lock = join(appDataDir(), '.lock'); await fs.writeFile(lock, 'another writer'); await assert.rejects(savePreferences({ last_project: 'changed' }), /锁定/u); assert.equal(await fs.readFile(lock, 'utf8'), 'another writer'); assert.deepEqual(await loadPreferences(), DEFAULTS);
 });
 
-test('CLI first-root question accepts piped input, while help/version never configure locations', async (t) => {
+test('switching an existing library decrypts its standalone vault but refuses unmigrated legacy keys', async (t) => {
+  const f = await fixture(t); noOverrides(); const first = join(f.base, 'first-secure'); await configureApp(new ScriptedConsole([first]));
+  const profile = { profile_id: 'c'.repeat(32), label: 'legacy', name: 'Fixture User', email: 'fixture@example.invalid', github_login: 'fixture-login', private_key: join(appDataDir(), 'profiles', 'c'.repeat(32), 'id_ed25519'), public_key: join(appDataDir(), 'profiles', 'c'.repeat(32), 'id_ed25519.pub') };
+  await fs.mkdir(dirname(profile.private_key), { recursive: true }); await fs.writeFile(profile.private_key, 'FIXTURE LEGACY KEY'); await fs.writeFile(profile.public_key, 'ssh-ed25519 AAAAfixture\n'); await fs.writeFile(join(dirname(profile.private_key), 'profile.json'), JSON.stringify({ schema_version: 2, ...profile, ssh_program: '', status: 'unverified', remember_auth: true, private_key: `profiles/${profile.profile_id}/id_ed25519`, public_key: `profiles/${profile.profile_id}/id_ed25519.pub` }));
+  if (process.platform !== 'win32') await fs.chmod(appDataDir(), 0o700);
+  const password = Buffer.from('fixture-password'); const created = await Vault.create(appDataDir(), password); password.fill(0); const session = new CredentialSession(created.vault); setSession(session); t.after(async () => { await currentSession()?.close(); setSession(undefined); });
+  const second = join(f.base, 'second-secure'); await fs.cp(first, second, { recursive: true }); const answers = [second, 'y', 'n'];
+  const interactive = new ScriptedConsole(answers, { secretInput: async () => Buffer.from('fixture-password') });
+  await assert.rejects(changeAppDirectory(interactive), /未迁移旧私钥/u);
+  assert.equal(appRoot(), first); assert.equal(currentSession(), session); assert.equal(session.closed, false); assert.deepEqual(JSON.parse(await fs.readFile(pointer(f), 'utf8')).appRoot, first);
+});
+
+test('three real target Vault password failures then exit leave the remembered location and protected session unchanged', async (t) => {
+  const f = await fixture(t); noOverrides(); const first = join(f.base, 'first-password'); await configureApp(new ScriptedConsole([first]));
+  const password = Buffer.from('fixture-password'); const created = await Vault.create(appDataDir(), password); password.fill(0);
+  const session = new CredentialSession(created.vault); setSession(session); t.after(async () => { await currentSession()?.close(); setSession(undefined); });
+  const second = join(f.base, 'second-password'); await fs.cp(first, second, { recursive: true });
+  const pointerBefore = await fs.readFile(pointer(f)), vaultBefore = await fs.readFile(join(second, 'data', 'vault.json'));
+  const inputs = Array.from({ length: 3 }, () => Buffer.from('wrong-fixture-password')), pending = [...inputs], failures = [], unlock = Vault.unlock;
+  t.mock.method(Vault, 'unlock', async function(...args) {
+    try { return await unlock.apply(this, args); } catch (error) { failures.push(error); throw error; }
+  });
+  const ui = new ScriptedConsole([second, 'y', '1', '1', '0'], { secretInput: async () => { assert.ok(pending.length); return pending.shift(); } });
+  await assert.rejects(changeAppDirectory(ui), Cancelled);
+  assert.equal(failures.length, 3); assert.ok(failures.every(error => error instanceof VaultUnlockError)); assert.deepEqual(pending, []); assert.deepEqual(ui.answers, []);
+  assert.ok(inputs.every(value => value.every(byte => byte === 0))); assert.deepEqual(await fs.readFile(pointer(f)), pointerBefore); assert.deepEqual(await fs.readFile(join(second, 'data', 'vault.json')), vaultBefore);
+  assert.equal(appRoot(), first); assert.equal(currentSession(), session); assert.equal(session.closed, false);
+});
+
+test('switching to an independently encrypted target asks its distinct password, commits it and closes the old session', async (t) => {
+  const f = await fixture(t); noOverrides(); const first = join(f.base, 'secure-first'); await configureApp(new ScriptedConsole([first]));
+  const password = Buffer.from('fixture-password'); const created = await Vault.create(appDataDir(), password); password.fill(0);
+  const session = new CredentialSession(created.vault); setSession(session); t.after(async () => { await currentSession()?.close(); setSession(undefined); });
+  const second = join(f.base, 'secure-second'), targetPassword = Buffer.from('independent-target-password');
+  const target = await Vault.create(join(second, 'data'), targetPassword); targetPassword.fill(0); await target.vault.put('fixture:target', Buffer.from('fixture-target-record')); target.vault.close();
+  let calls = 0; const entered = Buffer.from('independent-target-password');
+  const ui = new ScriptedConsole([second, 'y'], { secretInput: () => { calls++; return entered; } });
+  assert.equal(await changeAppDirectory(ui), true); assert.equal(calls, 1); assert.deepEqual(ui.answers, []); assert.ok(entered.every(byte => byte === 0));
+  assert.equal(appRoot(), second); assert.equal(appDataDir(), join(second, 'data')); assert.equal(session.closed, true); assert.equal(currentSession().vault.directory, join(second, 'data')); assert.equal(JSON.parse(await fs.readFile(pointer(f))).appRoot, second);
+  const value = await currentSession().vault.get('fixture:target'); assert.equal(value.toString(), 'fixture-target-record'); value.fill(0);
+});
+
+test('switching to a missing library requires explicit creation before new-password input and preserves the old library on decline', async t => {
+  const f = await fixture(t); noOverrides(); const first = join(f.base, 'create-source'); await configureApp(new ScriptedConsole([first]));
+  const created = await Vault.create(appDataDir(), Buffer.from('source-fixture-password'));
+  const session = new CredentialSession(created.vault); setSession(session); t.after(async () => { await currentSession()?.close(); await session.close(); setSession(undefined); });
+  const second = join(f.base, 'create-target'), before = await fs.readFile(pointer(f));
+  const declined = new ScriptedConsole([second, 'y', 'n'], { secretInput: () => assert.fail('declined creation must not prompt for a password') });
+  assert.equal(await changeAppDirectory(declined), false); assert.deepEqual(declined.answers, []);
+  assert.deepEqual(await fs.readFile(pointer(f)), before); await assert.rejects(fs.stat(second), { code: 'ENOENT' }); assert.equal(currentSession(), session); assert.equal(session.closed, false);
+  const entered = [Buffer.from('new-independent-password'), Buffer.from('new-independent-password')], pending = [...entered];
+  const accepted = new ScriptedConsole([second, 'y', 'y', 'y'], { secretInput: () => { assert.ok(pending.length); return pending.shift(); } });
+  assert.equal(await changeAppDirectory(accepted), true); assert.deepEqual(accepted.answers, []); assert.deepEqual(pending, []); assert.ok(entered.every(value => value.every(byte => byte === 0)));
+  assert.equal(session.closed, true); assert.equal(currentSession().vault.directory, join(second, 'data')); assert.equal(JSON.parse(await fs.readFile(pointer(f))).appRoot, second);
+  assert.equal((await fs.stat(join(first, 'data', 'vault.json'))).isFile(), true); assert.equal((await fs.stat(join(second, 'data', 'vault.json'))).isFile(), true);
+});
+
+test('activateUnlockedDirectory verifies a distinct target password without an OS authenticator', async t => {
+  const f = await fixture(t); noOverrides(); const first = join(f.base, 'activate-source'); await configureApp(new ScriptedConsole([first]));
+  const created = await Vault.create(appDataDir(), Buffer.from('source-fixture-password'));
+  const session = new CredentialSession(created.vault); setSession(session); t.after(async () => { await currentSession()?.close(); await session.close(); setSession(undefined); });
+  const next = join(f.base, 'activate-target'), target = await Vault.create(join(next, 'data'), Buffer.from('target-fixture-password')); target.vault.close();
+  const input = Buffer.from('target-fixture-password'), ui = new ScriptedConsole([], { secretInput: () => input });
+  const result = await activateUnlockedDirectory(ui, next);
+  assert.equal(result.dataDir, join(next, 'data')); assert.equal(result.persisted, true); assert.equal(appRoot(), next); assert.equal(session.closed, true);
+  assert.equal(currentSession().vault.directory, join(next, 'data')); assert.equal(JSON.parse(await fs.readFile(pointer(f))).appRoot, next); assert.ok(input.every(byte => byte === 0));
+});
+
+test('a failure after the old session closes cannot fall back to an unprotected menu session', async (t) => {
+  const f = await fixture(t); noOverrides(); const first = join(f.base, 'closed-first'); await configureApp(new ScriptedConsole([first])); const password = Buffer.from('fixture-password'); const created = await Vault.create(appDataDir(), password); password.fill(0); const session = new CredentialSession(created.vault); setSession(session); t.after(async () => { await currentSession()?.close(); setSession(undefined); });
+  const second = join(f.base, 'closed-second'); await fs.cp(first, second, { recursive: true }); const originalClose = session.close.bind(session); session.close = async () => { await originalClose(); throw new GitError('fixture-close-failed'); }; const ui = new ScriptedConsole([second, 'y'], { secretInput: () => Buffer.from('fixture-password') });
+  await assert.rejects(changeAppDirectory(ui), /fixture-close-failed/u); assert.equal(currentSession(), undefined); assert.equal(session.closed, true); assert.equal(appRoot(), first); assert.equal(JSON.parse(await fs.readFile(pointer(f))).appRoot, first);
+});
+
+test('code-only workflow driver accepts piped first-root input, while help/version never configure locations', async (t) => {
   const f = await fixture(t); noOverrides(); const root = join(f.base, 'pipe 软件');
-  const cli = fileURLToPath(new URL('../dist/cli.js', import.meta.url));
+  const cli = fileURLToPath(new URL('./cli-driver.mjs', import.meta.url));
   for (const flag of ['--help', '--version']) {
     const result = spawnSync(process.execPath, [cli, flag], { cwd: f.path, env: { ...process.env }, input: '', encoding: 'utf8', timeout: 10_000 }); assert.equal(result.status, 0, result.stderr); assert.equal(existsSync(pointer(f)), false); assert.equal(existsSync(root), false);
   }

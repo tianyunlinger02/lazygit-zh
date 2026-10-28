@@ -27,8 +27,22 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
+      - name: 设置 Go（原生密钥 / 权限助手）
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache-dependency-path: native/go.sum
       - name: 安装开发依赖
         run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: 准备已锁定的 Go 模块（CI 显式联网步骤）
+        working-directory: native
+        env:
+          GOTOOLCHAIN: local
+          GOMODCACHE: ${{ github.workspace }}/.claude-tmp/native-build/modules
+          GOTELEMETRY: "off"
+        run: go mod download
+      - name: 构建原生助手并运行密钥 / agent / 权限隔离测试
+        run: npm run build:native -- --test
       - name: 类型检查
         run: npm run typecheck
       - name: Node 测试（含本地 npm 安装）

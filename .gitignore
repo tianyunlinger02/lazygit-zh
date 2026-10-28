@@ -16,9 +16,13 @@ dist/
 /artifacts/typecheck-*.txt
 /artifacts/npm-ci-*.txt
 /artifacts/cli-smoke-*.txt
+/artifacts/login-security/
+/artifacts/local-trim/
 
 # Isolated tests and local task state
 .claude-tmp/
+/.autogit-sessions/
+/native/bin/
 /.claude/scheduled_tasks.lock
 
 # Local secrets; not a substitute for checking staged contents

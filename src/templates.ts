@@ -68,7 +68,7 @@ export async function ignoredTracked(directory: string): Promise<Buffer[]> {
 export async function stopTrackingIgnored(ui: Console, directory: string): Promise<number> {
   const git = await new Git(directory).repository(); const files = await ignoredTracked(git.directory);
   if (!files.length) { ui.text('没有已跟踪且被忽略规则匹配的文件。'); return 0; }
-  const { repositoryStamp, verifyRepositoryStamp } = await import('./destructive.js');
+  const { repositoryStamp, verifyRepositoryStamp } = await import('./repository-state.js');
   const stamp = await repositoryStamp(git);
   ui.text(`以下文件只从 index 停止跟踪，工作区文件保留：\n${files.map((file) => JSON.stringify(decodePath(file))).join('\n')}`);
   if (!await ui.confirm('确认仅从 Git index 移除以上文件？不删除磁盘文件、不提交。')) return 0;

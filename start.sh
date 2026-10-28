@@ -9,5 +9,5 @@ if [ ! -f "$SCRIPT_DIR/dist/cli.js" ]; then
     printf '%s\n' '源码还未构建。请在 AutoGit 源码目录先运行 npm ci 和 npm run build。' >&2
     exit 1
 fi
-# Keep the caller project directory; account data stays beside this portable launcher.
-exec node "$SCRIPT_DIR/dist/cli.js" --app-dir "$SCRIPT_DIR" "$@"
+# Keep the caller project directory; use the same first-run location flow as autogit.
+exec node "$SCRIPT_DIR/dist/cli.js" "$@"
