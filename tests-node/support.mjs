@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { createScratch } from '../scripts/scratch.mjs';
-import { Git } from '../dist/git.js';
-import { Console } from '../dist/ui.js';
-import { resetAppContextForTests } from '../dist/app-context.js';
+// Test-only module root: installed verification must share one production module graph.
+const moduleRoot = process.env.AUTOGIT_GITHUB_TEST_MODULE_DIR ?? new URL('../dist/', import.meta.url).href;
+const { Git } = await import(new URL('git.js', moduleRoot));
+const { Console } = await import(new URL('ui.js', moduleRoot));
+const { resetAppContextForTests } = await import(new URL('app-context.js', moduleRoot));
 
 export class ScriptedConsole extends Console {
   constructor(answers = [], { quick = false, secretInput } = {}) {

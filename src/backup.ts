@@ -7,7 +7,7 @@ import { currentSession, CredentialSession, setSession, unlockSession, hasVault,
 import { nativeRequest } from './auth.js';
 import { isManagedKey } from './managed-keys.js';
 import { GitError } from './git.js';
-import { ProfileStore } from './profiles.js';
+import { ProfileStore, isHttpsOnlyProfile, isSshProfile } from './profiles.js';
 import { HostStore } from './hosts.js';
 import { Cancelled, type Console } from './ui.js';
 import { checkedPath, exactKeys, isErrno, MISSING, mkdirPrivate, readJson, record, withStoreLock, writeJson } from './storage.js';
@@ -89,7 +89,11 @@ async function snapshotLocked(source: string, destination: string): Promise<Back
   checkedPath(destination, 'dir', { missing: true }); if (await exists(destination)) throw new GitError('备份目标已存在；不会覆盖。');
   const tree = await directoryTree(source, true);
   if (currentSession()) {
-    for (const profile of await new ProfileStore(source).list()) if (!await isManagedKey(profile.private_key)) throw new GitError('仍有未加密的旧托管私钥，请先完成迁移再备份。');
+    for (const profile of await new ProfileStore(source).list()) {
+      if (isHttpsOnlyProfile(profile)) continue;
+      if (!isSshProfile(profile)) throw new GitError('SSH 账号密钥元数据无效。');
+      if (!await isManagedKey(profile.private_key)) throw new GitError('仍有未加密的旧托管私钥，请先完成迁移再备份。');
+    }
   }
   await mkdirPrivate(path.dirname(destination)); await fsp.mkdir(destination, { mode: 0o700 }); await protectCreatedDirectory(destination);
   const filesRoot = path.join(destination, 'files'); await fsp.mkdir(filesRoot, { mode: 0o700 }); await protectCreatedDirectory(filesRoot);
@@ -137,7 +141,9 @@ export async function remapDataPaths(directory: string, mappings: Record<string,
   for (const [file, data] of writes) await writeJson(file, data);
 }
 async function validateStoreMetadata(directory: string): Promise<void> {
-  await new ProfileStore(directory).validateMetadata();
+  const store = new ProfileStore(directory);
+  await store.validateMetadata();
+  if ((await store.list()).some(isHttpsOnlyProfile) && !await hasVault(directory)) throw new GitError('HTTPS-only 账号的 vault.json 缺失；请恢复原凭据库，不会用空库替代原 Token。');
   await new HostStore(directory).all();
   const { ProjectStore } = await import('./projects.js'); await new ProjectStore(directory).list();
   const settings = await readJson(path.join(directory, 'settings.json'));
@@ -267,22 +273,26 @@ export async function backupMenu(ui: Console): Promise<void> {
     if (protectedSession && (!currentSession() || currentSession()!.closed)) throw new Cancelled('凭据会话已锁定，请重新启动并登录');
     if (!choice) return;
     try {
-      if (choice === 1) { ui.text(currentSession() ? '备份包含密文凭据库、公钥和普通元数据；不含恢复码、AutoGit 解锁密码或会话密钥。外部工具管理的凭据不在备份中。' : '旧版备份包含全部 AutoGit data 和托管私钥；不包含外部 gh 令牌和 location 指针。备份不是加密文件，请妥善保管。'); const target = await ui.ask('新备份目录绝对路径（必须不存在）'); const manifest = await createBackup(target); ui.text(`已校验备份：${manifest.files.length} 个文件。`); }
-      else if (choice === 2) { const manifest = await validateBackup(await ui.ask('备份目录绝对路径')); ui.text(`SHA-256、路径和版本校验通过：${manifest.files.length} 个文件。`); }
+      if (choice === 1) { ui.text(currentSession() ? '备份包含密文凭据库、公钥和普通元数据；不含恢复码、AutoGit 解锁密码或会话密钥。外部工具管理的凭据不在备份中。' : '旧版备份包含全部 AutoGit data 和托管私钥；不包含外部 gh 令牌和 location 指针。备份不是加密文件，请妥善保管。'); const target = await ui.ask('新备份目录绝对路径（必须不存在）'); const manifest = await createBackup(target); ui.success(`已校验备份：${manifest.files.length} 个文件。`); }
+      else if (choice === 2) { const manifest = await validateBackup(await ui.ask('备份目录绝对路径')); ui.success(`SHA-256、路径和版本校验通过：${manifest.files.length} 个文件。`); }
       else if (choice === 3) {
         const backup = await ui.ask('备份目录绝对路径'); await validateBackup(backup); const root = resolveApp({ appDir: await ui.ask('恢复到的软件根目录') }).appRoot; const data = path.join(root, 'data');
         const mappings = await remapPrompts(ui, backup); const ssh = await ui.menu('跨机 SSH 程序', ['改用当前系统 SSH（清除旧自定义程序绝对路径）', '保留备份的自定义 SSH 程序路径']); if (!ssh) continue;
         const replace = await exists(data); ui.text(`恢复目标：${data}${replace ? '（已存在，将替换；原资料保留在旁边的 data-before-restore-*）' : '（新位置）'}`);
         if (!await ui.confirm(replace ? '最终确认：替换目标 data 的全部现有资料？' : '确认恢复备份到这个新位置并切换？')) continue;
         const result = await restoreBackup(backup, data, { replace, pathRemap: mappings, sshProgram: ssh === 1 ? 'system' : 'preserve', ui, activate: true }); const activated = result.activated!;
-        ui.text(`已恢复并切换到 ${data}。${result.previousDataDir ? `原资料保留：${result.previousDataDir}` : ''}`);
+        ui.success(`已恢复并切换到 ${data}。${result.previousDataDir ? `原资料保留：${result.previousDataDir}` : ''}`);
         if (!activated.persisted) ui.text(`显式目录启动：下次请使用 --app-dir ${JSON.stringify(root)}，未改位置指针。`);
       } else if (choice === 4) {
         const root = await ui.ask('新的软件根目录（目标 data 必须不存在）');
         const keep = await ui.menu('迁移后旧资料', ['保留源 data（推荐）', '校验切换成功后删除源 data']); if (!keep) continue;
         if (!await ui.confirm(`最终确认：复制并校验后切换到 ${root}？${keep === 2 ? '成功后永久删除旧 data。' : '旧 data 保留原样。'}`)) continue;
-        const result = await relocateData(root, { deleteSource: keep === 2 }); ui.text(`已迁移并校验：${result.dataDir}`); if (!result.persisted) ui.text(`本次显式目录模式仅切换会话；下次使用 --app-dir ${JSON.stringify(root)}。`);
+        const result = await relocateData(root, { deleteSource: keep === 2 }); ui.success(`已迁移并校验：${result.dataDir}`); if (!result.persisted) ui.text(`本次显式目录模式仅切换会话；下次使用 --app-dir ${JSON.stringify(root)}。`);
       }
-    } catch (error) { if (error instanceof Cancelled) ui.text('已返回；未执行尚未确认的替换或删除。'); else if (error instanceof GitError || error instanceof Error && 'code' in error) ui.text(`资料操作未完成：${error.message}`); else throw error; }
+    } catch (error) {
+      if (error instanceof Cancelled) { if (error.warning) ui.warn(error.message); else ui.text('已返回；未执行尚未确认的替换或删除。'); }
+      else if (error instanceof GitError || error instanceof Error && 'code' in error) ui.error(`资料操作未完成：${error.message}`);
+      else throw error;
+    }
   }
 }

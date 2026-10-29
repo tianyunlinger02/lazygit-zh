@@ -2,6 +2,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { Git, GitError, type GitConfigEntry } from './git.js';
 import { CredentialHelper, createCredentialDirectory } from './credential-helper.js';
+import type { CredentialPin } from './credential-pin.js';
 import * as fs from 'node:fs/promises';
 import { currentSession, requireSession, type CredentialSession } from './session.js';
 import type { Console } from './ui.js';
@@ -42,9 +43,11 @@ export async function credentialsMenu(ui: Console, _directory: string, defaults:
   await enrollToken(ui, host, account); if (session !== requireSession()) throw new GitError('凭据会话已变化，请重试。'); ui.text('Token 已加密保存；账号归属尚未联网验证，API 操作前仍会核对 actor。');
 }
 
-interface HttpsTarget { host: { host: string }; url?: string }
+interface HttpsTarget { host: { host: string }; url?: string; pin?: CredentialPin }
 interface Scope { host: string; path: string; account: string }
 const helpers = new WeakMap<CredentialSession, Map<string, Promise<CredentialHelper>>>();
+// A proof is an identity, not merely an account/scope: never reuse an unpinned or earlier proof's helper.
+const pinnedHelpers = new WeakMap<CredentialPin, Map<string, Promise<CredentialHelper>>>();
 function checkedScope(urlValue: string, host: string, account: string): Scope {
   let url: URL;
   try { url = new URL(urlValue); } catch { throw new GitError('HTTPS 凭据需要明确的仓库 URL。'); }
@@ -64,20 +67,36 @@ async function inferScope(git: Git, host: string, account: string, explicit?: st
   }
   return scopes.length === 1 ? scopes[0] : undefined;
 }
-async function helperFor(session: CredentialSession, scope: Scope): Promise<CredentialHelper> {
-  let byScope = helpers.get(session); if (!byScope) { byScope = new Map(); helpers.set(session, byScope); }
+async function helperFor(session: CredentialSession, scope: Scope, pin?: CredentialPin): Promise<CredentialHelper> {
+  // Each map belongs to one session or one proof identity, never both.
+  let byScope = pin ? pinnedHelpers.get(pin) : helpers.get(session);
+  if (!byScope) {
+    byScope = new Map();
+    if (pin) {
+      const owned = byScope;
+      pin.onDispose(async () => { owned.clear(); pinnedHelpers.delete(pin); });
+      pinnedHelpers.set(pin, byScope);
+    } else helpers.set(session, byScope);
+  }
   const key = JSON.stringify(scope); let helper = byScope.get(key);
   if (!helper) {
-    helper = CredentialHelper.start({ session, host: scope.host, account: scope.account, repositoryPath: scope.path }); byScope.set(key, helper);
+    helper = CredentialHelper.start({ session, host: scope.host, account: scope.account, repositoryPath: scope.path, pin }); byScope.set(key, helper);
     helper.catch(() => { byScope!.delete(key); });
   }
   return helper;
 }
 /** Returns command-only overrides; does not persist helper commands or rewrite remote URLs. */
 export async function configureHttps(git: Git, profile: { github_login: string }, target: HttpsTarget): Promise<Git> {
-  const session = requireSession(), host = validateHost(target.host.host), account = loginName(profile.github_login), scope = await inferScope(git, host, account, target.url);
+  const session = requireSession(), host = validateHost(target.host.host), account = loginName(profile.github_login), pin = target.pin;
+  if (pin && (pin.host !== host || pin.account.toLowerCase() !== account.toLowerCase())) throw new GitError('HTTPS 认证绑定的 host / actor 与选定账号不一致。');
+  await pin?.assertCurrent();
+  // An explicit, validated API URL is used verbatim, including its repository-path case.
+  const scope = await inferScope(git, host, account, target.url);
   if (session !== currentSession() || session.closed) throw new GitError('HTTPS 凭据会话已关闭或变化。');
-  const helper = scope ? await helperFor(session, scope) : undefined;
+  if (pin && !scope) throw new GitError('HTTPS 认证绑定需要唯一、明确的仓库地址；不会回退到其他凭据。');
+  const helper = scope ? await helperFor(session, scope, pin) : undefined;
+  if (session !== currentSession() || session.closed) throw new GitError('HTTPS 凭据会话已关闭或变化。');
+  await pin?.assertCurrent();
   const config: GitConfigEntry[] = [
     ['credential.helper', ''], ...(helper ? [['credential.helper', helper.command()] as const] : []),
     ['credential.useHttpPath', 'true'], ['credential.username', account], ['credential.interactive', 'false'],

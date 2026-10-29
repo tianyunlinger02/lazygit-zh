@@ -1,11 +1,12 @@
 import * as fs from 'node:fs/promises';
+import { constants } from 'node:fs';
 import * as path from 'node:path';
 import { nativeRequest, NativeAuthError } from './auth.js';
 import { requireSession } from './session.js';
 import { GitError } from './git.js';
 import { type Console } from './ui.js';
-import { checkedPath, withStoreLock } from './storage.js';
-import type { Profile } from './profiles.js';
+import { checkedPath, isErrno, withStoreLock } from './storage.js';
+import { isHttpsOnlyProfile, isSshProfile, profileStoreDirectory, type Profile, type SshProfile } from './profiles.js';
 
 const MARKER = 'AUTOGIT-ENCRYPTED-SSH-1';
 export async function isManagedKey(file: string): Promise<boolean> {
@@ -15,6 +16,33 @@ export async function isManagedKey(file: string): Promise<boolean> {
   finally { await handle.close(); }
 }
 export function managedKeyMarker(profileId: string): Buffer { return Buffer.from(`${MARKER}\nssh:${profileId}\n`); }
+/** Include orphan files and explicit keyless folders; no profile type can hide a marker. */
+export async function managedKeyReferences(directory: string): Promise<string[]> {
+  const root = path.join(directory, 'profiles'); checkedPath(root, 'dir', { missing: true });
+  let folders: string[];
+  try { folders = await fs.readdir(root); } catch (error) { if (isErrno(error, 'ENOENT')) return []; throw error; }
+  const references = new Set<string>(); const header = Buffer.from(`${MARKER}\n`);
+  for (const profileId of folders) {
+    const folder = checkedPath(path.join(root, profileId), 'dir');
+    for (const entry of await fs.readdir(folder, { withFileTypes: true })) {
+      const file = checkedPath(path.join(folder, entry.name));
+      if (!entry.isFile()) continue;
+      checkedPath(file, 'file');
+      const handle = await fs.open(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+      try {
+        const info = await handle.stat();
+        if (!info.isFile() || info.nlink !== 1) throw new GitError('托管密钥引用路径异常。');
+        const bytes = Buffer.alloc(128), { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
+        const prefix = bytes.subarray(0, bytesRead);
+        if (!prefix.subarray(0, header.length).equals(header)) continue;
+        const expected = managedKeyMarker(profileId);
+        if (!/^[0-9a-f]{32}$/u.test(profileId) || info.size !== expected.length || !prefix.equals(expected)) throw new GitError('托管加密密钥引用损坏；请恢复原凭据库与账号资料（若 vault.json 缺失，不会创建空库）。');
+        references.add(`ssh:${profileId}`);
+      } finally { await handle.close(); }
+    }
+  }
+  return [...references];
+}
 export async function parsePrivateKey(ui: Console, original?: string): Promise<{ privateKey: Buffer; publicKey: string }> {
   let input: Buffer | undefined; let passphrase: Buffer | undefined;
   try {
@@ -40,8 +68,14 @@ export async function parsePrivateKey(ui: Console, original?: string): Promise<{
 
 export async function migrateManagedKeys(ui: Console, profiles: Profile[]): Promise<void> {
   const session = requireSession();
-  const pending: Profile[] = [];
-  for (const profile of profiles) if (!await isManagedKey(profile.private_key)) pending.push(profile);
+  const pending: SshProfile[] = [];
+  const root = (value: string): string => process.platform === 'win32' ? path.resolve(value).toLowerCase() : path.resolve(value);
+  for (const profile of profiles) {
+    if (root(profileStoreDirectory(profile)) !== root(session.vault.directory)) throw new GitError('此账号不属于当前解锁的凭据库。');
+    if (isHttpsOnlyProfile(profile)) continue;
+    if (!isSshProfile(profile)) throw new GitError('SSH 账号密钥元数据无效，未迁移。');
+    if (!await isManagedKey(profile.private_key)) pending.push(profile);
+  }
   if (!pending.length) return;
   ui.text(`检测到 ${pending.length} 个旧托管私钥。需要先加密迁移，完成后仅保留密文和公钥。外部导入原件与旧备份不变。`);
   if (!await ui.confirm('确认加密迁移并在校验成功后替换这些旧托管私钥？')) throw new GitError('未迁移旧私钥，凭据库未解锁供 Git 使用；请确认迁移后重新登录。');

@@ -1,10 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, stat, readdir, cp, mkdir, writeFile } from 'node:fs/promises';
+import { readFile, stat, readdir, cp, mkdir, writeFile, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Console, Cancelled, EndOfInput } from '../dist/ui.js';
 import { currentSession, CredentialSession, setSession, unlockSession, readNewPassword } from '../dist/session.js';
 import { Vault, VaultUnlockError } from '../dist/vault.js';
+import { ProfileStore } from '../dist/profiles.js';
+import { managedKeyMarker } from '../dist/managed-keys.js';
 import { createScratch } from '../scripts/scratch.mjs';
 
 const PASSWORD = 'synthetic-autogit-password';
@@ -201,6 +203,45 @@ test('managed markers, including wrong IDs, malformed suffixes and orphaned prof
     assert.equal(await readFile(file, 'utf8'), marker); assert.deepEqual(input.secretPrompts, []);
     assert.equal(currentSession(), undefined);
   }
+});
+
+test('strict HTTPS-only identity prevents missing-vault replacement without password prompts and still checks orphan markers', async t => {
+  const f = await fixture(t), first = await create(f.directory);
+  const session = new CredentialSession(first.vault); setSession(session);
+  const store = new ProfileStore(f.directory), input = loginUi(['y']);
+  const profile = await store.createHttps(input.ui, 'keyless', 'HTTPS User', 'https@example.invalid', 'https-user');
+  await session.storeToken('github.com', profile.github_login, Buffer.from('synthetic-keyless-token'));
+  await session.close(); await unlink(join(f.directory, 'vault.json'));
+  const file = join(store.profilesDir, profile.profile_id, 'profile.json'), metadata = await readFile(file);
+  const rejected = loginUi();
+  await assert.rejects(unlockSession(rejected.ui, f.directory, { allowCreate: true }), /HTTPS-only.*vault\.json 缺失/u);
+  assert.deepEqual(rejected.secretPrompts, []); assert.deepEqual(rejected.pending, []);
+  assert.deepEqual(await readFile(file), metadata); await assert.rejects(stat(join(f.directory, 'vault.json')), { code: 'ENOENT' });
+  const orphan = 'b'.repeat(32), folder = join(store.profilesDir, orphan); await mkdir(folder, { mode: 0o700 });
+  await writeFile(join(folder, 'retained-key'), managedKeyMarker(orphan), { mode: 0o600 });
+  await assert.rejects(unlockSession(loginUi().ui, f.directory, { allowCreate: true }), /托管加密密钥引用.*vault\.json 缺失/u);
+  // Schema 2 null paths are corrupt metadata, never reinterpreted as keyless.
+  await writeFile(file, JSON.stringify({ ...JSON.parse(metadata), schema_version: 2 }));
+  await assert.rejects(unlockSession(loginUi().ui, f.directory, { allowCreate: true }), /SSH 账号密钥元数据无效/u);
+  await assert.rejects(stat(join(f.directory, 'vault.json')), { code: 'ENOENT' });
+});
+
+test('keyless identity and encrypted Token survive real offline recovery without SSH state or profile rewrites', async t => {
+  const f = await fixture(t), first = await create(f.directory);
+  const session = new CredentialSession(first.vault); setSession(session);
+  const store = new ProfileStore(f.directory);
+  const profile = await store.createHttps(loginUi(['y']).ui, 'keyless-recovery', 'HTTPS User', 'https@example.invalid', 'https-user');
+  await session.storeToken('github.com', profile.github_login, Buffer.from('synthetic-recovered-token'));
+  const file = join(store.profilesDir, profile.profile_id, 'profile.json'), metadata = await readFile(file);
+  await session.close();
+  const input = loginUi(['1', 'y'], ['', first.recoveryCode, NEXT_PASSWORD, NEXT_PASSWORD]);
+  const recovered = await unlockSession(input.ui, f.directory);
+  assert.ok(input.secrets.every(zeroed)); assert.deepEqual(await readFile(file), metadata);
+  const loaded = await store.load(profile.profile_id); assert.equal(loaded.schema_version, 3); assert.equal(loaded.private_key, null); assert.equal(loaded.public_key, null);
+  const token = await recovered.getToken('github.com', profile.github_login);
+  try { assert.equal(token.toString(), 'synthetic-recovered-token'); } finally { token.fill(0); }
+  assert.deepEqual((await readdir(f.directory)).sort(), ['profiles', 'vault.json']);
+  assert.deepEqual(await readdir(join(store.profilesDir, profile.profile_id)), ['profile.json']);
 });
 
 test('corrupt stores fail closed instead of offering password retries, recovery or replacement', async t => {

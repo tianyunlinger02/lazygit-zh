@@ -139,7 +139,7 @@ async function startupDownload(ui: Console, current: string): Promise<string | u
     else {
       try { return await clone(ui, current); }
       catch (error) {
-        if (startupError(error)) ui.text('下载未确认成功；已有文件和可能的部分下载目录会保留，不自动重试或删除。');
+        if (startupError(error)) ui.warn('下载未确认成功；已有文件和可能的部分下载目录会保留，不自动重试或删除。');
         throw error;
       }
     }
@@ -159,7 +159,7 @@ export async function chooseStartupProject(ui: Console, current: string, lastPro
           if (!shortcuts.some(item => normalize(item.directory) === normalize(directory))) shortcuts.push({ label, source, directory });
         } catch (error) {
           if (!startupError(error)) throw error;
-          ui.text(`${label}路径不可用：${JSON.stringify(source)}；${error.message}。可选择其他文件夹，原记录保持不变。`);
+          ui.warn(`${label}路径不可用：${JSON.stringify(source)}；${error.message}。可选择其他文件夹，原记录保持不变。`);
         }
       }
       const choice = await ui.menu('启动项目选择', [
@@ -176,7 +176,7 @@ export async function chooseStartupProject(ui: Console, current: string, lastPro
       if (action === 1) return await startupDirectory(await chooseDirectory(ui, current));
       if (action === 2) {
         const directory = await createStartupDirectory(await chooseDirectory(ui, current, { existing: false }));
-        ui.text(`已创建本地文件夹：${JSON.stringify(directory)}；尚未初始化 Git、提交或上传。`);
+        ui.success(`已创建本地文件夹：${JSON.stringify(directory)}；尚未初始化 Git、提交或上传。`);
         return directory;
       }
       if (action === 3) {
@@ -192,11 +192,11 @@ export async function chooseStartupProject(ui: Console, current: string, lastPro
       try { return await startupDirectory(item.path); }
       catch (error) {
         if (!startupError(error)) throw error;
-        ui.text(`项目记录路径不可用：${JSON.stringify(item.path)}；${error.message}。记录未移除或更新，请重新选择。`);
+        ui.warn(`项目记录路径不可用：${JSON.stringify(item.path)}；${error.message}。记录未移除或更新，请重新选择。`);
       }
     } catch (error) {
-      if (error instanceof Cancelled) ui.text('已返回启动项目选择；未自动进入当前目录。');
-      else if (startupError(error)) ui.text(`项目选择未完成：${error.message}`);
+      if (error instanceof Cancelled) { if (error.warning) ui.warn(error.message); else ui.text('已返回启动项目选择；未自动进入当前目录。'); }
+      else if (startupError(error)) ui.error(`项目选择未完成：${error.message}`);
       else throw error;
     }
   }
@@ -216,14 +216,18 @@ export async function projectsMenu(ui: Console, directory: string): Promise<stri
       if (choice === 2) { const query = (await ui.ask('搜索（路径或名称）')).toLocaleLowerCase(); candidates = records.filter((item) => `${item.label} ${item.path}`.toLocaleLowerCase().includes(query)); if (!candidates.length) { ui.text('没有匹配项目。'); continue; } }
       const selected = await ui.menu('选择项目', candidates.map((item) => `${item.favorite ? '[收藏] ' : ''}${item.label} — ${item.path}`)); if (!selected) continue;
       const item = candidates[selected - 1];
-      if (choice === 1 || choice === 2) { try { await store.touch(item.path); return item.path; } catch (error) { ui.text(`项目路径不可用：${error instanceof Error ? error.message : String(error)}`); } }
+      if (choice === 1 || choice === 2) { try { await store.touch(item.path); return item.path; } catch (error) { ui.warn(`项目路径不可用：${error instanceof Error ? error.message : String(error)}`); } }
       else if (choice === 4) await store.setFavorite(item.project_id, !item.favorite);
       else if (choice === 5) { if (await ui.confirm(`移除项目记录 ${item.label}？不会删除项目文件。`)) await store.remove(item.project_id); }
       else if (choice === 6) {
         const next = await ui.ask('新项目绝对路径'); const updated = await store.remap(item.path, next);
-        ui.text('已按旧绝对路径重新映射项目记录、账号绑定与主机配置；不会按同名项目猜测。');
+        ui.success('已按旧绝对路径重新映射项目记录、账号绑定与主机配置；不会按同名项目猜测。');
         if (directory === item.path) return updated.path;
       }
-    } catch (error) { if (error instanceof Cancelled) ui.text('已返回，未修改项目记录。'); else if (error instanceof GitError || error instanceof Error && 'code' in error) ui.text(`项目操作未完成：${error.message}`); else throw error; }
+    } catch (error) {
+      if (error instanceof Cancelled) { if (error.warning) ui.warn(error.message); else ui.text('已返回，未修改项目记录。'); }
+      else if (error instanceof GitError || error instanceof Error && 'code' in error) ui.error(`项目操作未完成：${error.message}`);
+      else throw error;
+    }
   }
 }

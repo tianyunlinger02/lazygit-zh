@@ -8,6 +8,7 @@ import { inputText, safeDisplay } from './github.js';
 import { checkedPath } from './storage.js';
 import { confirmGithubWrite, githubSession, type GithubSession } from './github-repositories.js';
 import type { Console } from './ui.js';
+import { isHttpsOnlyProfile, resolveBinding } from './profiles.js';
 
 export interface PublicKey { readonly file: string; readonly text: string; readonly algorithm: string; readonly fingerprint: string }
 const TYPES = ['ssh-ed25519', 'ssh-rsa', 'ecdsa-sha2-nistp256', 'ecdsa-sha2-nistp384', 'ecdsa-sha2-nistp521', 'sk-ssh-ed25519@openssh.com', 'sk-ecdsa-sha2-nistp256@openssh.com'];
@@ -53,6 +54,8 @@ export async function readPublicKey(file: string): Promise<PublicKey> {
   } finally { await handle.close(); }
 }
 export async function uploadPublicKey(ui: Console, session: GithubSession): Promise<void> {
+  if (isHttpsOnlyProfile(session.profile)) { ui.text('此 HTTPS-only 账号没有 SSH 公钥；HTTPS / Token 无需上传公钥。'); return; }
+  if (typeof session.profile.public_key !== 'string') throw new GitError('SSH 账号公钥元数据无效，不会选择外部密钥。');
   const file = path.resolve(await ui.ask('明确选择要上传的 .pub 公钥文件', session.profile.public_key));
   const key = await readPublicKey(file), title = inputText(await ui.ask('GitHub SSH 公钥标题', `AutoGit ${session.profile.label}`));
   if (!await confirmGithubWrite(ui, session, undefined, '添加认证 SSH 公钥（不是私钥）', `文件：${file}\n算法：${key.algorithm}\n指纹：${key.fingerprint}\n标题：${title}\n作用：此公钥将获得选定 GitHub 账号的 Git SSH 认证能力；不会读取配对私钥。`)) return;
@@ -61,6 +64,8 @@ export async function uploadPublicKey(ui: Console, session: GithubSession): Prom
   ui.text(safeDisplay(`GitHub 已接受 SSH 公钥添加请求：${key.fingerprint}。这不等于已验证 SSH 网络连接或组织 SSO 授权。`));
 }
 export async function publicKeyMenu(ui: Console, directory: string): Promise<void> {
+  const profile = await resolveBinding(directory);
+  if (profile && isHttpsOnlyProfile(profile)) { ui.text('此 HTTPS-only 账号没有 SSH 公钥；HTTPS / Token 无需上传公钥。'); return; }
   const session = await githubSession(ui, directory); if (session) await uploadPublicKey(ui, session);
 }
 export const publicKeyUploadMenu = publicKeyMenu;

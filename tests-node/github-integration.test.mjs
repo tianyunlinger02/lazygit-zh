@@ -40,7 +40,7 @@ test('legacy workflow CLI (code-only unlock stub) new GitHub menu creates an Iss
   const log = join(f.base, 'gh.jsonl'); const env = { ...process.env, PATH: `${bin}${delimiter}${process.env.PATH}`, FIXTURE_GH_LOG: log };
   // GitHub group -> Issue menu -> explicit target -> create -> final confirmation -> return.
   // Repository management also invites a collaborator, entirely under the same fixture actor.
-  const answers = ['3', '', '12', '', 'acme', '3', 'demo', '2', 'CLI issue fixture', '3', '', '', 'y', '0', '9', 'acme', '3', 'demo', '3', 'bob', '2', 'y', '0', '0', '0'];
+  const answers = ['3', '12', '', '', 'acme', '3', 'demo', '2', 'CLI issue fixture', '3', '', '', 'y', '0', '9', 'acme', '3', 'demo', '3', 'bob', '2', 'y', '0', '0', '0'];
   const cliPath = fileURLToPath(new URL('./cli-driver.mjs', import.meta.url));
   const result = await runProcess(process.execPath, [cliPath, '--path', f.project], { cwd: f.base, env, inputData: Buffer.from(answers.join('\n') + '\n') });
   const text = result.stdout.toString() + result.stderr.toString(); assert.equal(result.status, 0, text); assert.match(text, /已创建 Issue #42/u); assert.match(text, /GitHub 已接受权限请求/u); assert.match(text, /已退出/u); assert.doesNotMatch(text, /程序异常/u);

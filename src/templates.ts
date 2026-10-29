@@ -56,7 +56,7 @@ export async function writeTemplate(ui: Console, directory: string, name: '.giti
     const now = await existingContent(file); if (now !== before) throw new GitError('目标文件在操作期间已变化；未覆盖。');
     if (before === undefined) { await fs.copyFile(temporary, file, 1); await fs.unlink(temporary); } else await fs.rename(temporary, file);
   } finally { await fs.unlink(temporary).catch((error: unknown) => { if (!isErrno(error, 'ENOENT')) throw error; }); }
-  ui.text(`已生成 ${name}；没有暂存或提交。`); return true;
+  ui.success(`已生成 ${name}；没有暂存或提交。`); return true;
 }
 export async function ignoredTracked(directory: string): Promise<Buffer[]> {
   const git = new Git(directory); const result = await git.run(['ls-files', '-ci', '--exclude-standard', '-z']);
@@ -92,6 +92,10 @@ export async function templatesMenu(ui: Console, directory: string): Promise<voi
       else if (choice === 3) await stopTrackingIgnored(ui, directory);
       else if (choice === 4) await writeTemplate(ui, directory, 'README.md', readmeText(await ui.ask('项目名称', path.basename(directory)), await ui.ask('项目说明', '', { allowEmpty: true })));
       else if (choice === 5) { const selected = await ui.menu('许可证', LICENSE_IDS); if (!selected) continue; const holder = await ui.ask('版权所有者'); const year = await ui.ask('版权年份', String(new Date().getFullYear())); await writeTemplate(ui, directory, 'LICENSE', licenseText(LICENSE_IDS[selected - 1], holder, year)); }
-    } catch (error) { if (error instanceof Cancelled) ui.text('已返回；已完成的文件保留。'); else if (error instanceof GitError || error instanceof Error && 'code' in error) ui.text(`模板操作未完成：${error.message}`); else throw error; }
+    } catch (error) {
+      if (error instanceof Cancelled) { if (error.warning) ui.warn(error.message); else ui.text('已返回；已完成的文件保留。'); }
+      else if (error instanceof GitError || error instanceof Error && 'code' in error) ui.error(`模板操作未完成：${error.message}`);
+      else throw error;
+    }
   }
 }

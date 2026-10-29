@@ -5,8 +5,8 @@ import { checkedPath, location, readJson, writeJson, withStoreLock, MISSING, rec
 import { GitError } from './git.js';
 import { Cancelled, type Console } from './ui.js';
 import { currentSession, CredentialSession, setSession, unlockSession, hasVault } from './session.js';
-import { migrateManagedKeys, isManagedKey } from './managed-keys.js';
-import { ProfileStore } from './profiles.js';
+import { migrateManagedKeys, isManagedKey, managedKeyReferences } from './managed-keys.js';
+import { ProfileStore, isHttpsOnlyProfile, isSshProfile } from './profiles.js';
 
 type Environment = Record<string, string | undefined>;
 export interface AppOptions { appDir?: string; dataDir?: string; env?: Environment; deferLocationCommit?: boolean }
@@ -102,7 +102,7 @@ async function chooseRoot(ui: Console, env: Environment, initial: string, existi
       return root;
     } catch (error) {
       if (!(error instanceof GitError || error instanceof Error && 'code' in error)) throw error;
-      ui.text(`位置不可用：${error.message} 请重新选择；输入 :q 可返回。`);
+      ui.error(`位置不可用：${error.message} 请重新选择；输入 :q 可返回。`);
     }
   }
 }
@@ -112,13 +112,18 @@ async function credentialDataExists(data: string): Promise<boolean> {
   try { await fs.lstat(data); } catch (error) { if (isErrno(error, 'ENOENT')) return false; throw error; }
   const profiles = await new ProfileStore(data).list();
   if (!profiles.length) return false;
-  for (const profile of profiles) if (await isManagedKey(profile.private_key)) return false;
+  if ((await managedKeyReferences(data)).length) return false;
+  for (const profile of profiles) {
+    if (isHttpsOnlyProfile(profile)) return false;
+    if (!isSshProfile(profile)) throw new GitError('SSH 账号密钥元数据无效。');
+    if (await isManagedKey(profile.private_key)) return false;
+  }
   return true;
 }
 
 async function recoverLocation(ui: Console, env: Environment, remembered: string): Promise<string> {
   for (;;) {
-    ui.text(`已记住的资料位置缺少凭据库：${remembered}。可能是文件夹被移动、磁盘未挂载或凭据库丢失；不会自动创建空库替代。`);
+    ui.warn(`已记住的资料位置缺少凭据库：${remembered}。可能是文件夹被移动、磁盘未挂载或凭据库丢失；不会自动创建空库替代。`);
     const choice = await ui.menu('找回 AutoGit 资料', ['重试原位置（例如重新挂载磁盘后）', '选择已搬迁或恢复的 AutoGit 文件夹', '明确创建新的加密资料库（不恢复旧凭据）'], '退出');
     if (!choice) throw new Cancelled('未选择资料位置');
     try {
@@ -135,7 +140,7 @@ async function recoverLocation(ui: Console, env: Environment, remembered: string
     } catch (error) {
       if (error instanceof Cancelled) continue;
       if (!(error instanceof GitError || error instanceof Error && 'code' in error)) throw error;
-      ui.text(`资料位置未更改：${error.message}`);
+      ui.error(`资料位置未更改：${error.message}`);
     }
   }
 }
@@ -197,14 +202,27 @@ export async function prepareCredentialDirectory(ui: Console | undefined, sessio
     await store.validateMetadata();
     const profiles = await store.list();
     if (ui) await migrateManagedKeys(ui, profiles);
-    else for (const profile of profiles) if (!await isManagedKey(profile.private_key)) throw new GitError('切换到目标资料前必须完成旧托管私钥迁移；请从菜单执行并解锁目标凭据库。');
+    else for (const profile of profiles) {
+      if (isHttpsOnlyProfile(profile)) continue;
+      if (!isSshProfile(profile)) throw new GitError('SSH 账号密钥元数据无效。');
+      if (!await isManagedKey(profile.private_key)) throw new GitError('切换到目标资料前必须完成旧托管私钥迁移；请从菜单执行并解锁目标凭据库。');
+    }
     const verified = new Set<string>();
     for (const profile of profiles) {
+      if (isHttpsOnlyProfile(profile)) continue;
+      if (!isSshProfile(profile)) throw new GitError('SSH 账号密钥元数据无效。');
       if (!await isManagedKey(profile.private_key)) throw new GitError('目标仍有未加密的托管私钥，未切换资料。');
       const id = `ssh:${profile.profile_id}`, secret = await session.vault.get(id);
       try { if (!secret?.length) throw new GitError('目标托管私钥缺少对应的可解密凭据，未切换资料。'); }
       finally { secret?.fill(0); }
       verified.add(id);
+    }
+    for (const reference of await managedKeyReferences(session.vault.directory)) {
+      if (verified.has(reference)) continue;
+      const secret = await session.vault.get(reference);
+      try { if (!secret?.length) throw new GitError('托管加密密钥引用缺少对应的可解密凭据，未切换资料。'); }
+      finally { secret?.fill(0); }
+      verified.add(reference);
     }
     const document = await readJson(path.join(session.vault.directory, 'vault.json'));
     if (!record(document) || !Array.isArray(document.records)) throw new GitError('目标凭据库记录无效。');

@@ -27,6 +27,15 @@ test('upload sends only public bytes through gh ssh-key add and keeps title expl
   await publicKeys.uploadPublicKey(ui, session(f.client, { profile: { github_login: 'alice', label: 'Fixture', public_key: file } }));
   const call = f.calls.find(item => item.args[0] === 'ssh-key'); assert.deepEqual(call.args, ['ssh-key', 'add', '-', '--title', 'title', '--type', 'authentication']); assert.equal(call.options.inputData.toString(), `${valid}\n`); assert.doesNotMatch(call.options.inputData.toString(), /PRIVATE/u);
 });
+test('HTTPS-only public-key upload stops without a path prompt, file access or gh call', async () => {
+  const f = fixtureClient(), ui = new ScriptedConsole([]);
+  await publicKeys.uploadPublicKey(ui, session(f.client, { profile: {
+    schema_version: 3, github_login: 'alice', label: 'HTTPS-only', private_key: null, public_key: null,
+    ssh_program: '', status: 'unverified', remember_auth: false,
+  } }));
+  assert.match(ui.transcript, /没有 SSH 公钥/u); assert.equal(f.calls.length, 0);
+  await assert.rejects(publicKeys.uploadPublicKey(new ScriptedConsole([]), session(f.client, { profile: { schema_version: 2, github_login: 'alice', label: 'broken SSH', private_key: null, public_key: null } })), /公钥元数据无效/u);
+});
 test('unknown public-key write is not retried or deleted', async t => {
   const f = fixtureClient({ handler: ({ args }) => args[0] === 'ssh-key' ? result(undefined, 1, 'timeout fixture-secret') : undefined });
   const temp = await temporary(t); const file = join(temp, 'key.pub'); await writeFile(file, valid);

@@ -12,7 +12,8 @@ import { CredentialSession, currentSession, setSession } from '../dist/session.j
 import { managedKeyMarker } from '../dist/managed-keys.js';
 import { savePreferences } from '../dist/preferences.js';
 import { Profile, ProfileStore } from '../dist/profiles.js';
-import { GitError } from '../dist/git.js';
+import { Git, GitError } from '../dist/git.js';
+import { HostStore, DEFAULT_HOST } from '../dist/hosts.js';
 import { fixture, ScriptedConsole } from './support.mjs';
 
 async function fixtureData(f) {
@@ -197,6 +198,70 @@ test('an independent encrypted backup cannot be installed without UI or a matchi
   const target = join(f.base, 'locked-target', 'data'); await fs.mkdir(target, { recursive: true }); await fs.writeFile(join(target, 'keep.txt'), 'locked-target-unchanged');
   await assert.rejects(restoreBackup(backup, target, { replace: true }), /解锁|验证|凭据会话/u);
   assert.equal(currentSession(), undefined); assert.deepEqual(await fs.readdir(target), ['keep.txt']); assert.equal(await fs.readFile(join(target, 'keep.txt'), 'utf8'), 'locked-target-unchanged');
+});
+
+test('mixed schema 2 SSH and schema 3 HTTPS-only encrypted backup restore remaps strict snapshots without rewriting profile metadata', async t => {
+  const f = await fixture(t), session = await currentVaultSession(t, f, true);
+  const store = new ProfileStore(), ssh = (await store.list())[0];
+  await fs.writeFile(ssh.private_key, managedKeyMarker(ssh.profile_id));
+  await session.vault.put(`ssh:${ssh.profile_id}`, Buffer.from('synthetic-encrypted-SSH-record'));
+  const https = await store.createHttps(new ScriptedConsole(['y']), 'https-fixture', 'HTTPS Fixture', 'https@example.invalid', 'fixture');
+  await session.storeToken('github.com', https.github_login, Buffer.from('synthetic-shared-backup-token'));
+  const transport = { mode: 'https', host: { ...DEFAULT_HOST } };
+  await new HostStore().set(f.path, transport); await store.bind(f.path, https.profile_id, transport);
+  const sshMetadata = join(store.profilesDir, ssh.profile_id, 'profile.json'), httpsMetadata = join(store.profilesDir, https.profile_id, 'profile.json');
+  const beforeSsh = await fs.readFile(sshMetadata), beforeHttps = await fs.readFile(httpsMetadata), beforeKnown = await fs.readFile(join(store.directory, 'known_hosts'));
+  const backup = join(f.base, 'mixed-profile-backup'), manifest = await createBackup(backup);
+  assert.equal(manifest.files.filter(item => item.path.startsWith(`profiles/${https.profile_id}/`)).length, 1);
+  const project = join(f.base, 'remapped HTTPS project'); await fs.mkdir(project); await new Git(project).run(['init', '--initial-branch=main']);
+  const target = join(f.base, 'mixed-restored', 'data');
+  await restoreBackup(backup, target, { pathRemap: { [f.path]: project }, sshProgram: 'system' });
+  assert.deepEqual(await fs.readFile(join(target, 'profiles', ssh.profile_id, 'profile.json')), beforeSsh);
+  assert.deepEqual(await fs.readFile(join(target, 'profiles', https.profile_id, 'profile.json')), beforeHttps);
+  assert.deepEqual(await fs.readFile(join(target, 'known_hosts')), beforeKnown);
+  const bindings = JSON.parse(await fs.readFile(join(target, 'bindings.json')));
+  assert.equal(bindings.schema_version, 2); assert.deepEqual(Object.keys(bindings.bindings), [process.platform === 'win32' ? project.toLowerCase() : project]);
+  assert.equal(Object.values(bindings.bindings)[0].snapshot.schema_version, 3);
+  assert.equal(Object.values(bindings.bindings)[0].snapshot.private_key, null);
+  await session.close();
+  const password = Buffer.from('fixture-password'); let restored;
+  try { restored = new CredentialSession(await Vault.unlock(target, password)); } finally { password.fill(0); }
+  setSession(restored);
+  const loaded = await new ProfileStore(target).resolveBinding(project);
+  assert.equal(loaded.profile_id, https.profile_id); assert.equal(loaded.private_key, null); assert.equal(loaded.public_key, null);
+  const token = await restored.getToken('github.com', https.github_login);
+  try { assert.equal(token.toString(), 'synthetic-shared-backup-token'); } finally { token.fill(0); }
+  assert.equal((await new ProfileStore(target).load(ssh.profile_id)).schema_version, 2);
+  assert.deepEqual(await fs.readdir(join(target, 'profiles', https.profile_id)), ['profile.json']);
+});
+
+test('HTTPS-only relocation verifies a real encrypted Token, retains keyless schema and creates no SSH artifacts', async t => {
+  const f = await fixture(t), session = await currentVaultSession(t, f), store = new ProfileStore();
+  const profile = await store.createHttps(new ScriptedConsole(['y']), 'relocate-keyless', 'HTTPS User', 'https@example.invalid', 'https-user');
+  await session.storeToken('github.com', profile.github_login, Buffer.from('synthetic-relocated-token'));
+  const transport = { mode: 'https', host: { ...DEFAULT_HOST } };
+  await new HostStore().set(f.path, transport); await store.bind(f.path, profile.profile_id, transport);
+  const metadata = await fs.readFile(join(store.profilesDir, profile.profile_id, 'profile.json'));
+  const root = join(f.base, 'keyless-relocated'), result = await relocateData(root);
+  assert.equal(result.dataDir, join(root, 'data')); assert.equal(session.closed, true);
+  assert.equal(currentSession().vault.directory, result.dataDir);
+  const moved = await new ProfileStore().resolveBinding(f.path);
+  assert.equal(moved.schema_version, 3); assert.equal(moved.private_key, null); assert.equal(moved.public_key, null);
+  assert.deepEqual(await fs.readFile(join(result.dataDir, 'profiles', profile.profile_id, 'profile.json')), metadata);
+  assert.equal(existsSync(join(result.dataDir, 'known_hosts')), false);
+  assert.equal(existsSync(join(root, '.autogit-sessions')), false);
+  assert.deepEqual(await fs.readdir(join(result.dataDir, 'profiles', profile.profile_id)), ['profile.json']);
+  const token = await currentSession().getToken('github.com', profile.github_login);
+  try { assert.equal(token.toString(), 'synthetic-relocated-token'); } finally { token.fill(0); }
+});
+
+test('HTTPS-only backup with a lost vault is not accepted as a portable legacy SSH store', async t => {
+  const f = await fixture(t), session = await currentVaultSession(t, f), store = new ProfileStore();
+  const profile = await store.createHttps(new ScriptedConsole(['y']), 'lost-vault', 'HTTPS User', 'https@example.invalid', 'https-user');
+  const file = join(store.profilesDir, profile.profile_id, 'profile.json'), before = await fs.readFile(file);
+  await session.close(); await fs.unlink(join(store.directory, 'vault.json'));
+  await assert.rejects(createBackup(join(f.base, 'missing-keyless-vault-backup')), /vault\.json 缺失/u);
+  assert.deepEqual(await fs.readFile(file), before); assert.equal(existsSync(join(store.directory, 'vault.json')), false);
 });
 
 test('backup menu refuses to continue as a legacy menu if its protected session closes', async t => {

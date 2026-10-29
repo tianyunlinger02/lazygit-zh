@@ -103,18 +103,18 @@ export async function autoIgnoreLargeFiles(ui: Console, repo: Git, changes: read
       const info = await lstat(filePath(repo, change.path));
       if (!info.isFile() || info.isSymbolicLink() || info.size <= DEFAULT_LARGE_FILE_BYTES) continue;
       excluded.add(change.path);
-      if (change.path === '.gitignore') { ui.text('.gitignore 本身已超过 50 MiB，本次不加入提交，也不添加自我忽略规则。'); continue; }
+      if (change.path === '.gitignore') { ui.warn('.gitignore 本身已超过 50 MiB，本次不加入提交，也不添加自我忽略规则。'); continue; }
       candidates.push({ name: change.path, raw: encodePath(change.path), rule: exactRule(encodePath(change.path)), info });
     } catch (error) {
       if (isErrno(error, 'ENOENT')) continue;
-      excluded.add(change.path); ui.text(`无法检查 ${display(change.path)} 的大小，本次跳过：${error instanceof Error ? error.message : String(error)}`);
+      excluded.add(change.path); ui.warn(`无法检查 ${display(change.path)} 的大小，本次跳过：${error instanceof Error ? error.message : String(error)}`);
     }
   }
   if (!candidates.length) return excluded;
   try {
     const tracked = await trackedPaths(repo, changes);
     let eligible = candidates.filter(item => { if (!tracked.has(item.name)) return true; excluded.delete(item.name); return false; });
-    for (const item of eligible) if (!item.rule) ui.text(`超大文件 ${display(item.name)} 的名称含换行，无法写入 .gitignore；仅跳过本次提交。`);
+    for (const item of eligible) if (!item.rule) ui.warn(`超大文件 ${display(item.name)} 的名称含换行，无法写入 .gitignore；仅跳过本次提交。`);
     eligible = eligible.filter(item => item.rule);
     if (!eligible.length) return excluded;
     const file = path.join(repo.directory, '.gitignore'), before = await readIgnore(file);
@@ -126,20 +126,20 @@ export async function autoIgnoreLargeFiles(ui: Console, repo: Git, changes: read
       try {
         const info = await lstat(filePath(repo, item.name));
         if (!info.isFile() || info.isSymbolicLink() || info.size <= DEFAULT_LARGE_FILE_BYTES) { excluded.delete(item.name); continue; }
-        if (!sameFile(item.info, info)) { ui.text(`超大文件 ${display(item.name)} 在检查期间变化，未追加规则；本次跳过。`); continue; }
+        if (!sameFile(item.info, info)) { ui.warn(`超大文件 ${display(item.name)} 在检查期间变化，未追加规则；本次跳过。`); continue; }
         live.push(item);
-      } catch (error) { if (!isErrno(error, 'ENOENT')) ui.text(`无法复核超大文件 ${display(item.name)}，本次跳过。`); }
+      } catch (error) { if (!isErrno(error, 'ENOENT')) ui.warn(`无法复核超大文件 ${display(item.name)}，本次跳过。`); }
     }
     if (!live.length) return excluded;
     const additions = additionsFor(before?.bytes ?? Buffer.alloc(0), live);
     if (additions.length) await appendIgnore(file, before, additions);
     const ignored = await ignoredPaths(repo, live);
     for (const item of live) {
-      if (ignored.has(item.name)) ui.text(`已自动忽略 ${display(item.name)}（${(Number(item.info.size) / 1024 / 1024).toFixed(1)} MiB，默认阈值 50 MiB）；文件仍保留在磁盘。`);
-      else ui.text(`超大文件 ${display(item.name)} 的忽略规则未生效（可能被子目录规则重新包含）；仅跳过本次提交，不修改其它规则。`);
+      if (ignored.has(item.name)) ui.warn(`已自动忽略 ${display(item.name)}（${(Number(item.info.size) / 1024 / 1024).toFixed(1)} MiB，默认阈值 50 MiB）；文件仍保留在磁盘。`);
+      else ui.warn(`超大文件 ${display(item.name)} 的忽略规则未生效（可能被子目录规则重新包含）；仅跳过本次提交，不修改其它规则。`);
     }
   } catch (error) {
-    ui.text(`自动忽略未完成，以下超大未跟踪文件仅跳过本次提交，其它文件仍可保存：${candidates.map(item => display(item.name)).join('、')}。${error instanceof Error ? `原因：${error.message}` : ''}`);
+    ui.warn(`自动忽略未完成，以下超大未跟踪文件仅跳过本次提交，其它文件仍可保存：${candidates.map(item => display(item.name)).join('、')}。${error instanceof Error ? `原因：${error.message}` : ''}`);
   }
   return excluded;
 }

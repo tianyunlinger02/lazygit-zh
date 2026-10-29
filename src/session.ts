@@ -1,5 +1,4 @@
 import * as fs from 'node:fs/promises';
-import { constants } from 'node:fs';
 import * as path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
@@ -134,11 +133,11 @@ export async function readNewPassword(ui: Console): Promise<Buffer> {
       try { validateNewPassword(password); }
       catch (error) {
         if (!(error instanceof GitError)) throw error;
-        password.fill(0); ui.text(error.message); continue;
+        password.fill(0); ui.error(error.message); continue;
       }
       confirmation = await ui.secret('再次输入新的 AutoGit 解锁密码：');
       if (password.length !== confirmation.length || !timingSafeEqual(password, confirmation)) {
-        password.fill(0); confirmation.fill(0); ui.text('两次密码不一致，请重新设置。'); continue;
+        password.fill(0); confirmation.fill(0); ui.error('两次密码不一致，请重新设置。'); continue;
       }
       const result = password; password = undefined; return result;
     } finally { password?.fill(0); confirmation?.fill(0); }
@@ -147,33 +146,13 @@ export async function readNewPassword(ui: Console): Promise<Buffer> {
 
 /** Dynamic imports avoid profiles -> session -> profiles initialization cycles. No data is written. */
 async function rejectMissingManagedVault(directory: string): Promise<void> {
-  const { ProfileStore } = await import('./profiles.js');
-  const { managedKeyMarker } = await import('./managed-keys.js');
-  const store = new ProfileStore(directory);
-  await store.list(); // Validate profile metadata as well as orphaned marker directories.
-  let folders: string[];
-  try { folders = await fs.readdir(store.profilesDir); }
-  catch (error) { if (isErrno(error, 'ENOENT')) return; throw error; }
-  for (const id of folders) {
-    const folder = checkedPath(path.join(store.profilesDir, id), 'dir');
-    const marker = managedKeyMarker(id), header = marker.subarray(0, marker.indexOf(10) + 1);
-    try {
-      for (const entry of await fs.readdir(folder, { withFileTypes: true })) {
-        const file = checkedPath(path.join(folder, entry.name));
-        if (!entry.isFile()) continue;
-        checkedPath(file, 'file');
-        const prefix = Buffer.alloc(header.length);
-        let handle: fs.FileHandle | undefined;
-        try {
-          handle = await fs.open(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-          const info = await handle.stat();
-          if (!info.isFile() || info.nlink !== 1) throw new GitError('托管密钥引用路径异常。');
-          const { bytesRead } = await handle.read(prefix, 0, prefix.length, 0);
-          if (prefix.subarray(0, bytesRead).equals(header)) throw new GitError('检测到托管加密密钥引用，但 vault.json 缺失；请恢复原凭据库，不会创建空库覆盖关联。');
-        } finally { prefix.fill(0); await handle?.close(); }
-      }
-    } finally { marker.fill(0); header.fill(0); }
-  }
+  const { ProfileStore, isHttpsOnlyProfile } = await import('./profiles.js');
+  const { managedKeyReferences } = await import('./managed-keys.js');
+  const profiles = await new ProfileStore(directory).list(); // Broken schema 2 is never keyless.
+  // Scan every orphan even when a keyless profile is present; neither type hides markers.
+  const references = await managedKeyReferences(directory);
+  if (references.length) throw new GitError('检测到托管加密密钥引用，但 vault.json 缺失；请恢复原凭据库，不会创建空库覆盖关联。');
+  if (profiles.some(isHttpsOnlyProfile)) throw new GitError('检测到 HTTPS-only 账号，但 vault.json 缺失；请恢复原凭据库，不会创建空库替代原 Token。');
 }
 
 async function acknowledgeRecoveryCode(ui: Console, result: { vault: Vault; recoveryCode: string }, rotated: boolean): Promise<Vault> {
@@ -233,8 +212,8 @@ export async function unlockSession(ui: Console, directoryValue: string, options
         } finally { password.fill(0); }
         if (vault) break;
         if (empty) { vault = await chooseRecovery(ui, directory, '忘记 AutoGit 解锁密码'); break; }
+        if (failed) ui.error('密码未能解锁凭据库，原数据未修改。');
         if (failed && attempt < 3) {
-          ui.text('密码未能解锁凭据库，原数据未修改。');
           const choice = await ui.menu('选择解锁方式', ['重试 AutoGit 解锁密码', '使用离线恢复码恢复'], '退出');
           if (!choice) throw new Cancelled('未解锁凭据库，已退出');
           if (choice === 2) { vault = await recoverSessionVault(ui, directory); break; }

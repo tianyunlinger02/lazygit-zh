@@ -8,13 +8,15 @@ import { dispatch, main, runMenu, VERSION } from '../dist/cli.js';
 import { fileURLToPath } from 'node:url';
 import { fixture, ScriptedConsole } from './support.mjs';
 import { ProfileStore } from '../dist/profiles.js';
+import { DEFAULT_TRANSPORT, HostStore } from '../dist/hosts.js';
 import { Git } from '../dist/git.js';
 import { Vault } from '../dist/vault.js';
+import { writePersonalCliDriver } from './personal-support.mjs';
 
 const cli = fileURLToPath(new URL('./cli-driver.mjs', import.meta.url));
 const packageVersion = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version;
-async function launch(f, answers, args = [], env = process.env) {
-  const result = await runProcess(process.execPath, [cli, '--path', f.path, ...args], { cwd: f.path, env, inputData: Buffer.from(answers.join('\n') + '\n') });
+async function launch(f, answers, args = [], env = process.env, driver = cli) {
+  const result = await runProcess(process.execPath, [driver, '--path', f.path, ...args], { cwd: f.path, env, inputData: Buffer.from(answers.join('\n') + '\n') });
   return { ...result, text: result.stdout.toString('utf8') + result.stderr.toString('utf8') };
 }
 test('help/version and invalid flags do not create data or pointer', async t => {
@@ -70,7 +72,7 @@ test('legacy workflow CLI (code-only unlock stub) cancels file selection without
 });
 test('legacy workflow CLI (code-only unlock stub) generates a managed remembered account, binds and commits with no Python', { skip: !which('ssh') || !which('ssh-keygen') }, async t => {
   const f = await fixture(t); await f.write();
-  const result = await launch(f, ['4', '1', '1', 'y', '测试软件账号', 'Managed User', 'managed@example.invalid', 'fixture-login', '4', '1', '0', '1', '5', 'a', 'Node CLI commit', '0']);
+  const result = await launch(f, ['4', '1', '1', '2', 'y', '测试软件账号', 'Managed User', 'managed@example.invalid', 'fixture-login', '4', '1', '0', '1', '5', 'a', 'Node CLI commit', '0']);
   assert.equal(result.status, 0, result.text); assert.match(result.text, /已保存账号/); assert.match(result.text, /ssh-ed25519 /); assert.match(result.text, /https:\/\/github.com\/settings\/keys/);
   assert.equal(await f.git.value('log', '-1', '--format=%an <%ae>'), 'Managed User <managed@example.invalid>');
   assert.equal(await f.git.config('user.name'), '测试用户');
@@ -254,34 +256,26 @@ test('advanced setup menu and main dispatch allow returning without changes', as
 
 async function creationCliFixture(t) {
   const f = await fixture(t);
+  // The code-only legacy unlock driver intentionally exercises explicit SSH, not HTTPS security.
+  await new HostStore().set(f.path, DEFAULT_TRANSPORT);
   const realGit = which('git');
   assert.ok(realGit);
-  const tools = join(f.base, 'fake tools'); await mkdir(tools);
+  const tools = join(f.base, 'offline git tools'); await mkdir(tools);
   await writeFile(join(tools, 'package.json'), '{"type":"commonjs"}\n');
-  const ghLog = join(f.base, 'gh-calls.jsonl');
+  const nativeLog = join(f.base, 'native-api-stub-calls.jsonl');
+  const ghLog = join(f.base, 'forbidden-gh-calls.jsonl');
+  const driver = join(f.base, 'native-personal-cli-driver.mjs');
+  await writePersonalCliDriver(driver);
   const pushLog = join(f.base, 'push-calls.jsonl');
   const bare = join(f.base, 'creation-target.git'); await mkdir(bare);
   await new Git(bare).run(['init', '--bare', '--initial-branch=main']);
   const store = new ProfileStore();
   const profile = await store.create(new ScriptedConsole(['y']), 'CLI fixture', 'Managed CLI', 'cli@example.invalid', 'fixture-login', { remember_auth: true });
   assert.ok(profile); await store.bind(f.path, profile.profile_id);
+  // This is a failing sentinel, not a gh creation implementation: every invocation is a bug.
   await writeFile(join(tools, 'gh'), `#!/usr/bin/env node
-const fs = require('node:fs');
-const assert = require('node:assert/strict');
-const args = process.argv.slice(2);
-fs.appendFileSync(process.env.AUTOGIT_TEST_GH_LOG, JSON.stringify({ args, host: process.env.GH_HOST, config: process.env.GH_CONFIG_DIR }) + '\\n');
-assert.equal(process.env.GH_HOST, 'github.com');
-assert.equal(process.env.GH_TOKEN, undefined);
-const full = 'fixture-login/' + process.env.AUTOGIT_TEST_REPO;
-if (JSON.stringify(args) === JSON.stringify(['api', '--hostname', 'github.com', '--method', 'GET', 'user', '--jq', '.login'])) {
-  process.stdout.write('fixture-login\\n');
-} else if (JSON.stringify(args) === JSON.stringify(['repo', 'create', full, '--' + process.env.AUTOGIT_TEST_VISIBILITY])) {
-  fs.writeFileSync(process.env.AUTOGIT_TEST_CREATED, full);
-  process.stdout.write('Created fixture repository\\n');
-} else if (JSON.stringify(args) === JSON.stringify(['api', '--hostname', 'github.com', '--method', 'GET', 'repos/' + full, '--jq', '{owner: {login: .owner.login}, name: .name, full_name: .full_name, private: .private, html_url: .html_url, ssh_url: .ssh_url, clone_url: .clone_url}'])) {
-  assert.equal(fs.readFileSync(process.env.AUTOGIT_TEST_CREATED, 'utf8'), full);
-  process.stdout.write(JSON.stringify({ name: process.env.AUTOGIT_TEST_REPO, full_name: full, owner: {login: 'fixture-login'}, private: process.env.AUTOGIT_TEST_VISIBILITY === 'private', html_url: 'https://github.com/' + full, ssh_url: 'git@github.com:' + full + '.git', clone_url: 'https://github.com/' + full + '.git' }));
-} else { throw new Error('Unexpected fake gh command'); }
+require('node:fs').appendFileSync(process.env.AUTOGIT_TEST_GH_LOG, JSON.stringify(process.argv.slice(2)) + '\\n');
+throw new Error('Personal creation must not invoke gh');
 `, { mode: 0o700 });
   await writeFile(join(tools, 'git'), `#!/usr/bin/env node
 const fs = require('node:fs');
@@ -299,15 +293,15 @@ if (args.includes('push')) {
 const result = spawnSync(process.env.AUTOGIT_TEST_REAL_GIT, args, {stdio: 'inherit', env: process.env});
 process.exit(result.status ?? 1);
 `, { mode: 0o700 });
-  return { ...f, ghLog, pushLog, bare, env: { ...process.env, PATH: `${tools}${delimiter}${process.env.PATH ?? ''}`, AUTOGIT_TEST_GH_LOG: ghLog, AUTOGIT_TEST_PUSH_LOG: pushLog, AUTOGIT_TEST_CREATED: join(f.base, 'created.txt'), AUTOGIT_TEST_REAL_GIT: realGit, AUTOGIT_TEST_BARE: bare } };
+  return { ...f, driver, nativeLog, ghLog, pushLog, bare, env: { ...process.env, PATH: `${tools}${delimiter}${process.env.PATH ?? ''}`, AUTOGIT_TEST_NATIVE_LOG: nativeLog, AUTOGIT_TEST_GH_LOG: ghLog, AUTOGIT_TEST_PUSH_LOG: pushLog, AUTOGIT_TEST_CREATED: join(f.base, 'created.txt'), AUTOGIT_TEST_REAL_GIT: realGit, AUTOGIT_TEST_BARE: bare } };
 }
 
 for (const [visibility, choice] of [['private', '1'], ['public', '2']]) {
-  test(`legacy workflow CLI (code-only unlock stub) creates a ${visibility} fixture repository, links and uploads offline`, { skip: process.platform === 'win32' || !which('ssh') || !which('ssh-keygen') }, async t => {
+  test(`legacy workflow CLI (code-only unlock/native API stubs) creates a ${visibility} fixture repository, links and uploads offline`, { skip: process.platform === 'win32' || !which('ssh') || !which('ssh-keygen') }, async t => {
     const f = await creationCliFixture(t); await f.write();
     const repo = `cli-${visibility}`;
     const env = { ...f.env, AUTOGIT_TEST_REPO: repo, AUTOGIT_TEST_VISIBILITY: visibility };
-    const result = await launch(f, ['1', '2', '', '1', '', repo, choice, 'y', 'a', `create ${visibility}`, '', '0'], [], env);
+    const result = await launch(f, ['1', '2', '', '1', repo, choice, 'y', 'a', `create ${visibility}`, '', '0'], [], env, f.driver);
     assert.equal(result.status, 0, result.text);
     assert.match(result.text, /推送成功/u);
     assert.match(result.text, /已退出/u);
@@ -316,26 +310,30 @@ for (const [visibility, choice] of [['private', '1'], ['public', '2']]) {
     assert.equal(await f.git.value('rev-parse', 'HEAD'), await new Git(f.bare).value('rev-parse', 'main'));
     assert.equal(await f.git.value('log', '-1', '--format=%an <%ae>'), 'Managed CLI <cli@example.invalid>');
     assert.equal(await f.git.config('user.name'), '测试用户');
-    const calls = (await readFile(f.ghLog, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
-    const writes = calls.filter(call => call.args[0] === 'repo');
-    assert.deepEqual(writes.map(call => call.args), [['repo', 'create', `fixture-login/${repo}`, `--${visibility}`]]);
-    assert.ok(calls.some(call => call.args.includes(`repos/fixture-login/${repo}`)));
-    assert.ok(calls.every(call => call.host === 'github.com' && call.config === env.GH_CONFIG_DIR));
+    const calls = (await readFile(f.nativeLog, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    assert.deepEqual(calls, [
+      { method: 'authenticate', account: 'fixture-login' },
+      { method: 'createRepository', owner: 'fixture-login', name: repo, visibility },
+    ]);
+    assert.equal(await readFile(env.AUTOGIT_TEST_CREATED, 'utf8'), `fixture-login/${repo}`);
+    await assert.rejects(stat(f.ghLog), { code: 'ENOENT' });
+    assert.doesNotMatch(result.text, /新地址的本地远程别名|给这个远程起一个名字|操作未完成|请输入 0 到/u);
     assert.equal((await readFile(f.pushLog, 'utf8')).trim().split('\n').length, 1);
     if (process.env.AUTOGIT_VERIFICATION_DIR) {
-      await writeFile(join(process.env.AUTOGIT_VERIFICATION_DIR, `cli-creation-${visibility}-${packageVersion}.txt`), `OFFLINE FIXTURE ONLY: fake gh and a real local bare Git target.\n${result.text}\nFake gh calls:\n${JSON.stringify(calls, null, 2)}\n`);
+      await writeFile(join(process.env.AUTOGIT_VERIFICATION_DIR, `cli-creation-${visibility}-${packageVersion}.txt`), `CODE-ONLY OFFLINE FIXTURE: unlock and native API methods are stubbed; Git uploads to a real local bare target. No HTTP/OAuth/token/session or real GitHub/SSH interoperability evidence. No gh commands were invoked.\n${result.text}\nNative API stub calls:\n${JSON.stringify(calls, null, 2)}\n`);
     }
   });
 }
 
-test('legacy workflow CLI (code-only unlock stub) declining final public creation makes no repository and no push', { skip: process.platform === 'win32' || !which('ssh') || !which('ssh-keygen') }, async t => {
+test('legacy workflow CLI (code-only unlock/native API stubs) declining final public creation makes no repository and no push', { skip: process.platform === 'win32' || !which('ssh') || !which('ssh-keygen') }, async t => {
   const f = await creationCliFixture(t);
   const env = { ...f.env, AUTOGIT_TEST_REPO: 'cancelled-public', AUTOGIT_TEST_VISIBILITY: 'public' };
-  const result = await launch(f, ['1', '2', '', '1', '', 'cancelled-public', '2', 'n', '0'], [], env);
+  const result = await launch(f, ['1', '2', '', '1', 'cancelled-public', '2', 'n', '0'], [], env, f.driver);
   assert.equal(result.status, 0, result.text); assert.match(result.text, /已退出/u);
   assert.deepEqual(await f.git.remotes(), []);
-  const calls = (await readFile(f.ghLog, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
-  assert.ok(calls.length > 0); assert.ok(calls.every(call => call.args[0] === 'api'));
+  const calls = (await readFile(f.nativeLog, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(calls, [{ method: 'authenticate', account: 'fixture-login' }]);
+  await assert.rejects(stat(f.ghLog), { code: 'ENOENT' });
   await assert.rejects(stat(env.AUTOGIT_TEST_CREATED), {code: 'ENOENT'});
   await assert.rejects(stat(f.pushLog), {code: 'ENOENT'});
 });

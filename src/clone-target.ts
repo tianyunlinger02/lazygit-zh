@@ -28,14 +28,14 @@ async function inspect(directory: string): Promise<DirectoryIdentity | undefined
 export async function chooseCloneTarget(ui: Console, parent: string, defaultName: string): Promise<CloneTarget> {
   for (;;) {
     const name = await ui.ask('新建文件夹名称（也可使用已有空目录）', defaultName);
-    if (!validName(name)) { ui.text('请输入单个普通文件夹名称，不要包含盘符、路径分隔符或特殊符号。'); continue; }
+    if (!validName(name)) { ui.error('请输入单个普通文件夹名称，不要包含盘符、路径分隔符或特殊符号。'); continue; }
     const directory = path.join(parent, name);
     if (!await unchangedParent(parent)) throw new GitError('目标父目录已变化，请重新选择父目录。');
     try {
       const identity = await inspect(directory);
       if (identity) ui.text('将使用这个已有空目录，不删除或清空其他内容。');
       return { directory, ...(identity ? { identity } : {}) };
-    } catch (error) { if (!(error instanceof GitError)) throw error; ui.text(error.message); }
+    } catch (error) { if (!(error instanceof GitError)) throw error; ui.error(error.message); }
   }
 }
 export async function verifyCloneTarget(target: CloneTarget): Promise<void> {

@@ -136,7 +136,13 @@ export async function hostsMenu(ui: Console, directory: string): Promise<void> {
       }
       const target = validateTransport({ mode: modeValue, ...(mode === 4 ? { credentials: 'external' } : {}), host: { provider: providerValue, host, apiHost, webBase, sshHost, ...(port ? { sshPort: /^\d+$/u.test(port) ? Number(port) : NaN } : {}), ...(user ? { sshUser: user } : {}), ...(alias ? { sshAlias: alias } : {}) } });
       await store.set(directory, target);
-      ui.text(`已保存本项目配置；不会改写现有 remote。原生模式允许现有 Host / ProxyCommand / ProxyJump；配置的 alias 需用于远程地址。${modeValue === 'https' && !externalHttps ? 'HTTPS 仅使用当前加密库；请绑定账号并在“HTTPS / GitHub 凭据”录入 Token。' : '外部 SSH / HTTPS 缓存不纳入加密库，退出 AutoGit 不会清除它们。'}`);
-    } catch (error) { if (error instanceof Cancelled) ui.text('已返回，未保存配置。'); else if (error instanceof GitError || error instanceof Error && 'code' in error) ui.text(`主机配置未完成：${error.message}`); else throw error; }
+      ui.success('已保存本项目配置；不会改写现有 remote。');
+      ui.text('原生模式允许现有 Host / ProxyCommand / ProxyJump；配置的 alias 需用于远程地址。');
+      ui.warn(modeValue === 'https' && !externalHttps ? 'HTTPS 仅使用当前加密库；请绑定账号并在“HTTPS / GitHub 凭据”录入 Token。' : '外部 SSH / HTTPS 缓存不纳入加密库，退出 AutoGit 不会清除它们。');
+    } catch (error) {
+      if (error instanceof Cancelled) { if (error.warning) ui.warn(error.message); else ui.text('已返回，未保存配置。'); }
+      else if (error instanceof GitError || error instanceof Error && 'code' in error) ui.error(`主机配置未完成：${error.message}`);
+      else throw error;
+    }
   }
 }

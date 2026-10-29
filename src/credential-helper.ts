@@ -10,7 +10,8 @@ import { nativeRequest } from './auth.js';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkedPath, isErrno, parseStrictJson } from './storage.js';
-import type { CredentialSession } from './session.js';
+import { currentSession, type CredentialSession } from './session.js';
+import type { CredentialPin } from './credential-pin.js';
 import { GitError } from './git.js';
 
 const PROTOCOL = 1, MAX_MESSAGE = 16_384, MAX_TOKEN = 4096;
@@ -115,20 +116,42 @@ export async function createCredentialDirectory(session: CredentialSession, pref
   } catch (error) { await fs.rm(child, { recursive: true, force: true }); throw error; }
 }
 
-export interface CredentialHelperOptions { session: CredentialSession; host: string; account: string; repositoryPath: string }
+export interface CredentialHelperOptions { session: CredentialSession; host: string; account: string; repositoryPath: string; pin?: CredentialPin }
 
 export class CredentialHelper {
   readonly host: string; readonly account: string; readonly repositoryPath: string;
   readonly endpoint: string; readonly secret: string;
   #server: Server | undefined; #closed = false; #started = false; readonly #sockets = new Set<Socket>();
-  private readonly session: CredentialSession; private readonly cleanupDirectory: string;
+  #closing: Promise<void> | undefined; #removePinCleanup: (() => void) | undefined;
+  private readonly session: CredentialSession; private readonly cleanupDirectory: string; private readonly pin?: CredentialPin;
   private constructor(options: CredentialHelperOptions, endpoint: string, secret: string, cleanupDirectory: string) {
-    this.session = options.session; this.host = host(options.host); this.account = account(options.account); this.repositoryPath = repositoryPath(options.repositoryPath); this.endpoint = endpoint; this.secret = secret; this.cleanupDirectory = cleanupDirectory;
+    this.session = options.session; this.pin = options.pin; this.host = host(options.host); this.account = account(options.account); this.repositoryPath = repositoryPath(options.repositoryPath); this.endpoint = endpoint; this.secret = secret; this.cleanupDirectory = cleanupDirectory;
   }
-  static async start(options: CredentialHelperOptions): Promise<CredentialHelper> {
+  static start(options: CredentialHelperOptions): Promise<CredentialHelper> {
+    let pending: Promise<CredentialHelper>, removeCleanup: (() => void) | undefined;
+    try {
+      // Register before the first await or directory allocation: task disposal also owns an in-flight start.
+      removeCleanup = options.pin?.onDispose(async () => {
+        const helper = await pending.catch(() => undefined);
+        await helper?.close();
+      });
+      pending = CredentialHelper.create(options);
+    } catch (error) { removeCleanup?.(); return Promise.reject(error); }
+    void pending.then((helper) => { helper.#removePinCleanup = removeCleanup; }, () => { removeCleanup?.(); });
+    return pending;
+  }
+  private static async create(options: CredentialHelperOptions): Promise<CredentialHelper> {
+    if (options.session.closed || currentSession() !== options.session) throw invalid('HTTPS 凭据会话已关闭或变化。');
+    if (options.pin && (options.pin.host !== host(options.host) || options.pin.account.toLowerCase() !== account(options.account).toLowerCase())) throw invalid('HTTPS 认证绑定的 host / actor 不匹配。');
+    await options.pin?.assertCurrent();
     const child = await createCredentialDirectory(options.session, 'c-');
     const helper = new CredentialHelper(options, endpointName(child), crypto.randomBytes(32).toString('base64url'), child);
-    try { await helper.listen(); options.session.onClose(() => helper.close()); return helper; }
+    try {
+      await helper.listen();
+      if (options.session.closed || currentSession() !== options.session) throw invalid('HTTPS 凭据会话已关闭或变化。');
+      await options.pin?.assertCurrent();
+      options.session.onClose(() => helper.close()); return helper;
+    }
     catch (error) { await helper.close(); throw error; }
   }
   private async listen(): Promise<void> {
@@ -156,22 +179,33 @@ export class CredentialHelper {
     let request: Request;
     try { request = parseRequest(raw.subarray(0, raw.indexOf(10))); } catch { return { protocol: PROTOCOL, ok: false, code: 'invalid' }; }
     if (!equalSecret(request.secret, this.secret) || request.credential.host !== this.host || request.credential.path !== this.repositoryPath || request.credential.username !== undefined && request.credential.username.toLowerCase() !== this.account.toLowerCase()) return { protocol: PROTOCOL, ok: false, code: 'invalid' };
-    if (this.#closed || this.session.closed) return { protocol: PROTOCOL, ok: false, code: 'closed' };
+    if (this.#closed || this.session.closed || currentSession() !== this.session) return { protocol: PROTOCOL, ok: false, code: 'closed' };
     if (request.operation !== 'get') return { protocol: PROTOCOL, ok: true };
     const token = await this.session.getToken(this.host, this.account);
     if (!token) return { protocol: PROTOCOL, ok: false, code: 'missing' };
-    try { if (this.#closed || this.session.closed) return { protocol: PROTOCOL, ok: false, code: 'closed' }; const value = tokenText(token); return { protocol: PROTOCOL, ok: true, username: this.account, password: value }; }
-    finally { token.fill(0); }
+    try {
+      if (this.#closed || this.session.closed || currentSession() !== this.session) return { protocol: PROTOCOL, ok: false, code: 'closed' };
+      // Validate this exact Buffer, not another vault read that could race with replacement.
+      this.pin?.assertToken(this.session, token);
+      const value = tokenText(token);
+      if (this.#closed || this.session.closed || currentSession() !== this.session) return { protocol: PROTOCOL, ok: false, code: 'closed' };
+      return { protocol: PROTOCOL, ok: true, username: this.account, password: value };
+    } finally { if (Buffer.isBuffer(token)) token.fill(0); }
   }
   command(): string {
     if (!this.#started || this.#closed) throw new GitError('HTTPS 凭据辅助程序已经关闭。');
     return `!${shellQuote(process.execPath)} ${shellQuote(fileURLToPath(import.meta.url))} --socket ${shellQuote(this.endpoint)} --secret ${shellQuote(this.secret)}`;
   }
-  async close(): Promise<void> {
-    if (this.#closed) return; this.#closed = true; const server = this.#server; this.#server = undefined;
+  close(): Promise<void> {
+    if (this.#closing) return this.#closing;
+    this.#closed = true; const server = this.#server; this.#server = undefined;
+    this.#removePinCleanup?.(); this.#removePinCleanup = undefined;
     for (const socket of this.#sockets) socket.destroy(); this.#sockets.clear();
-    if (server) await new Promise<void>((resolve) => { server.close(() => resolve()); });
-    await fs.rm(this.cleanupDirectory, { recursive: true, force: true });
+    this.#closing = (async () => {
+      if (server) await new Promise<void>((resolve) => { server.close(() => resolve()); });
+      await fs.rm(this.cleanupDirectory, { recursive: true, force: true });
+    })();
+    return this.#closing;
   }
 }
 

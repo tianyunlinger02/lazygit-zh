@@ -13,6 +13,9 @@ import { DEFAULT_TRANSPORT, HostStore, resolveTransport, transportUrl, validateT
 import { checkedPath } from './storage.js';
 import { chooseCloneTarget, verifyCloneTarget } from './clone-target.js';
 import { Cancelled, type Console } from './ui.js';
+import { confirmPersonalRepository, createPersonalRepository, preparePersonalRepository } from './personal-repository.js';
+import { withTask } from './task-progress.js';
+import { PersonalGithubError } from './github-personal.js';
 
 export interface GithubSession {
   readonly client: GithubClient;
@@ -99,7 +102,7 @@ export async function githubSession(ui: Console, directory: string): Promise<Git
   const snapshot = { ...profile }, bindingSnapshot = binding ? { ...binding } : undefined;
   const store = new ProfileStore();
   const checkProfile = async (): Promise<void> => {
-    const current = await store.load(profile.profile_id), currentBinding = await resolveBinding(directory);
+    const current = await store.load(profile.profile_id, false), currentBinding = await resolveBinding(directory);
     if (!isDeepStrictEqual({ ...current }, snapshot) || !isDeepStrictEqual(currentBinding ? { ...currentBinding } : undefined, bindingSnapshot)) throw new GitError('选定 AutoGit 账号或项目绑定已变化；请重新进入操作，不会自动更换账号。');
     if (!isDeepStrictEqual(await resolveTransport(directory), configuredTransport)) throw new GitError('项目传输配置已变化；请重新预览，不会静默改用其它主机或认证模式。');
   };
@@ -157,8 +160,12 @@ export async function readBody(ui: Console, defaultValue = ''): Promise<string> 
 export async function githubAction(ui: Console, action: () => Promise<void>): Promise<void> {
   try { await action(); }
   catch (error) {
-    if (error instanceof Cancelled || error instanceof GitError) ui.text(safeDisplay(error.message));
-    else if (error instanceof Error && 'code' in error) ui.text('文件操作未完成；已有外部步骤不会自动恢复。请检查路径与权限。');
+    if (error instanceof Cancelled) {
+      if (error.warning) ui.warn(safeDisplay(error.message));
+      else ui.text(safeDisplay(error.message));
+    } else if (error instanceof PersonalGithubError && error.repositoryState !== 'not-created') ui.warn(safeDisplay(error.message));
+    else if (error instanceof GitError) ui.error(safeDisplay(error.message));
+    else if (error instanceof Error && 'code' in error) ui.error('文件操作未完成；已有外部步骤不会自动恢复。请检查路径与权限。');
     else throw error;
   }
 }
@@ -195,7 +202,7 @@ export async function cloneRepository(ui: Console, session: GithubSession, conte
     ui.text('新项目主机 / 传输配置已保存；origin 保持 clone 时的明确地址。');
     await bindProject(target.directory, session.profile);
   } catch {
-    ui.text(`下载目录保留；主机 / 传输配置${savedTransport ? '已保存' : '尚未保存'}，账号绑定未完成。请在项目工具核对主机及传输模式，再在账号管理明确绑定；不会自动回滚或改用默认认证。`);
+    ui.warn(`下载目录保留；主机 / 传输配置${savedTransport ? '已保存' : '尚未保存'}，账号绑定未完成。请在项目工具核对主机及传输模式，再在账号管理明确绑定；不会自动回滚或改用默认认证。`);
     return target.directory;
   }
   ui.text('下载、传输配置保存及 AutoGit 账号绑定均已完成；未执行项目脚本。');
@@ -266,14 +273,54 @@ async function permissionsMenu(ui: Console, session: GithubSession, context: Rep
   }
 }
 
+async function createPersonalOnly(ui: Console, directory: string): Promise<RepositoryContext | undefined> {
+  return withTask(ui, undefined, async task => {
+    for (const stage of ['associate', 'commit', 'upload', 'upstream'] as const) task.set(stage, 'not-applicable', '本次仅创建个人空仓库。');
+    const binding = await resolveBinding(directory), profile = binding ?? await chooseProfile(ui, { createHttps: true });
+    if (!profile) return undefined;
+    const snapshot = { ...profile }, bindingSnapshot = binding ? { ...binding } : undefined;
+    const transport = await resolveTransport(directory), store = new ProfileStore();
+    const checkContext = async (): Promise<void> => {
+      const current = await store.load(profile.profile_id, false), currentBinding = await resolveBinding(directory);
+      if (!isDeepStrictEqual({ ...current }, snapshot) || !isDeepStrictEqual(currentBinding ? { ...currentBinding } : undefined, bindingSnapshot) ||
+          !isDeepStrictEqual(await resolveTransport(directory), transport)) throw new GitError('账号、项目绑定或传输配置已变化，已停止；请重新选择，已完成步骤会保留。');
+    };
+    const draft = await preparePersonalRepository(ui, directory, profile.github_login, checkContext, task);
+    if (!draft || !await confirmPersonalRepository(ui, draft, '仅在 github.com 创建个人空仓库，不修改项目绑定、传输、本地远程、提交或文件，不上传代码。')) return undefined;
+    await checkContext();
+    const result = await createPersonalRepository(ui, draft, checkContext, task);
+    if (!result) return undefined;
+    const created = result.repository;
+    ui.success(`已核对个人仓库：${created.htmlUrl}。未关联本地项目，也未上传代码。`);
+    return repositoryContext('github.com', created.owner, created.name);
+  });
+}
+
 export async function githubMenu(ui: Console, directory: string): Promise<string | undefined> {
-  const session = await githubSession(ui, directory); if (!session) return undefined;
+  let session: GithubSession | undefined;
   let context: RepositoryContext | undefined;
   for (;;) {
-    const choice = await ui.menu(`GitHub 仓库${context ? ` · ${context.host}/${context.owner}/${context.name}` : ''}`, ['选择仓库 / 分页列表 / 搜索', '查看仓库', '下载选定仓库', '新建个人 / 组织空仓库', 'Fork 到个人 / 组织（不 clone、不关联远程）', '修改公开 / 私有', '重命名仓库', '删除仓库', '协作者 / 团队权限', '向选定账号上传 SSH 公钥', 'Pull requests', 'Issues', 'Tags / Releases']);
+    const choice = await ui.menu(`GitHub 仓库${context ? ` · ${context.host}/${context.owner}/${context.name}` : ''}`, ['选择仓库 / 分页列表 / 搜索', '查看仓库', '下载选定仓库', '新建空仓库（个人内置；组织 / Enterprise 需 gh）', 'Fork 到个人 / 组织（不 clone、不关联远程）', '修改公开 / 私有', '重命名仓库', '删除仓库', '协作者 / 团队权限', '向选定账号上传 SSH 公钥', 'Pull requests', 'Issues', 'Tags / Releases']);
     if (!choice) return undefined;
+    if (choice === 4) {
+      const mode = await ui.menu('新建空仓库的方式', ['github.com 个人空仓库（内置，无需 gh）', '组织 / GitHub Enterprise 空仓库（需 gh）']);
+      if (!mode) continue;
+      if (mode === 1) {
+        await githubAction(ui, async () => { context = await createPersonalOnly(ui, directory) ?? context; });
+        session = undefined;
+        continue;
+      }
+    }
+    if (!session) {
+      ui.text('本次 GitHub 协作功能需要可选工具 gh；个人建库可选择“新建空仓库 → 个人（内置）”，无需安装 gh。');
+      session = await githubSession(ui, directory);
+      if (!session) return undefined;
+      if (context?.host !== session.host) context = undefined;
+    }
+    const selectedSession = session;
     let downloaded: string | undefined;
     await githubAction(ui, async () => {
+      const session = selectedSession;
       if (choice === 1) { context = await chooseRepository(ui, session); return; }
       if (choice === 11) { const { pullRequestsMenu } = await import('./pull-requests.js'); await pullRequestsMenu(ui, directory); return; }
       if (choice === 12) { const { issuesMenu } = await import('./issues.js'); await issuesMenu(ui, directory); return; }
@@ -285,7 +332,7 @@ export async function githubMenu(ui: Console, directory: string): Promise<string
         const visibility: Visibility = selected === 1 ? 'private' : 'public';
         const target = repositoryContext(session.host, owner, name);
         if (await confirmGithubWrite(ui, session, target, '创建空仓库', `可见性：${visibility}\n不添加 README、提交、推送或本地 remote。组织创建权限由 GitHub 核对。`)) {
-          await session.client.createRepository(owner, name, visibility, (url) => ui.text(`已创建：${url}；后续验证失败也不会删除。`)); context = target;
+          await session.client.createRepository(owner, name, visibility, (url) => ui.success(`已创建：${url}；后续验证失败也不会删除。`)); context = target;
         }
         return;
       }

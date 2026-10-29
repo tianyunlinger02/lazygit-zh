@@ -1,7 +1,7 @@
 /** Chinese task prompts. A single input owner yields the terminal to native tools. */
 import { createInterface, type Interface } from 'node:readline';
 
-export class Cancelled extends Error { constructor(message = '已返回') { super(message); this.name = 'Cancelled'; } }
+export class Cancelled extends Error { constructor(message = '已返回', readonly warning = false) { super(message); this.name = 'Cancelled'; } }
 export class EndOfInput extends Error { constructor() { super('输入已结束'); this.name = 'EndOfInput'; } }
 export class SecretTooLong extends Error { constructor() { super('秘密输入过长'); this.name = 'SecretTooLong'; } }
 type Read = (prompt: string) => string | Promise<string>;
@@ -152,8 +152,19 @@ export function suspendInput(): void { terminal.suspend(); }
 export function resumeInput(): void { terminal.resume(); }
 export function closeInput(): void { terminal.close(); }
 
+const defaultOutput: Write = (message) => console.log(message);
+type ColorEnvironment = Readonly<Record<string, string | undefined>>;
+/** Escape controls instead of allowing user or subprocess data to control the terminal. */
+function diagnosticText(message: string): string {
+  return message.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f‪-‮⁦-⁩]/gu, (value) => `\\u${value.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
+
 export interface ConsoleOptions {
   quick?: boolean;
+  /** Code-only output capability override; injected writers otherwise default to plain text. */
+  diagnosticTty?: boolean;
+  /** Code-only environment substitute. Environment flags can suppress, never force, color. */
+  colorEnv?: ColorEnvironment;
   /** Code-level test input; ordinary string prompts are never reused for secrets. */
   secretInput?: SecretRead;
   secretMaxBytes?: number;
@@ -164,13 +175,23 @@ export class Console {
   private readonly secretInput: SecretRead;
   private readonly secretMaxBytes: number;
   private readonly injectedSecretInput: boolean;
-  constructor(private input: Read = (prompt) => terminal.read(prompt), private output: Write = (message) => console.log(message), options: ConsoleOptions = {}) {
+  private readonly diagnosticColor: boolean;
+  constructor(private input: Read = (prompt) => terminal.read(prompt), private output: Write = defaultOutput, options: ConsoleOptions = {}) {
     this.quick = options.quick ?? true;
+    const env = options.colorEnv ?? process.env;
+    this.diagnosticColor = (options.diagnosticTty ?? (output === defaultOutput && !!process.stdout.isTTY)) && !env.NO_COLOR && env.TERM !== 'dumb' && env.FORCE_COLOR !== '0';
     this.injectedSecretInput = typeof options.secretInput === 'function';
     this.secretInput = options.secretInput ?? ((prompt, maxBytes) => terminal.secret(prompt, maxBytes));
     this.secretMaxBytes = options.secretMaxBytes ?? DEFAULT_SECRET_MAX_BYTES;
   }
   text(message = ''): void { this.output(message); }
+  private diagnostic(label: string, color: number, message: string): void {
+    const safe = diagnosticText(message);
+    this.output(`${this.diagnosticColor ? `\x1b[${color}m[${label}]\x1b[39m` : `[${label}]`} ${safe}`);
+  }
+  error(message: string): void { this.diagnostic('错误', 31, message); }
+  warn(message: string): void { this.diagnostic('警告', 33, message); }
+  success(message: string): void { this.diagnostic('成功', 32, message); }
   /** Validate production secret-input capability without opening readline or consuming input. */
   requireSecretInput(): void {
     if (this.injectedSecretInput) return;
@@ -190,7 +211,7 @@ export class Console {
       if (answer === ':q') throw new Cancelled();
       const value = answer || defaultValue;
       if (value || options.allowEmpty) return value;
-      this.text('此项不能为空；输入 :q 可返回。');
+      this.error('此项不能为空；输入 :q 可返回。');
     }
   }
   async multiline(prompt: string, defaultValue = ''): Promise<string> {
@@ -210,7 +231,7 @@ export class Console {
       if (!value) return defaultValue;
       if (['y', 'yes', '是', '确认'].includes(value)) return true;
       if (['n', 'no', '否', '不'].includes(value)) return false;
-      this.text('请输入 y（是）或 n（否）。');
+      this.error('请输入 y（是）或 n（否）。');
     }
   }
   async routineConfirm(prompt: string, defaultValue = false): Promise<boolean> { return this.quick || await this.confirm(prompt, defaultValue); }
@@ -220,7 +241,7 @@ export class Console {
       const value = (await this.input('请选择编号：')).trim();
       if ([':q', 'q'].includes(value)) return 0;
       if (/^\d+$/u.test(value) && Number(value) <= options.length) return Number(value);
-      this.text(`请输入 0 到 ${options.length} 之间的编号。`);
+      this.error(`请输入 0 到 ${options.length} 之间的编号。`);
     }
   }
   async select(options: readonly string[]): Promise<number[]> {
@@ -231,7 +252,7 @@ export class Console {
       if (value.toLowerCase() === 'a') return options.map((_, index) => index);
       const parts = value.split(/[\s,，]+/u);
       if (parts.every((part) => /^\d+$/u.test(part) && Number(part) >= 1 && Number(part) <= options.length)) return [...new Set(parts.map(Number))].sort((a, b) => a - b).map((item) => item - 1);
-      this.text('编号无效，请重新选择；不会修改任何文件。');
+      this.error('编号无效，请重新选择；不会修改任何文件。');
     }
   }
 }

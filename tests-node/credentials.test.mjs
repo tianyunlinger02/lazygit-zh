@@ -3,6 +3,8 @@ import test from 'node:test';
 import fs from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { connect } from 'node:net';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import { createScratch } from '../scripts/scratch.mjs';
 const root = process.env.AUTOGIT_GITHUB_TEST_MODULE_DIR ?? new URL('../dist/', import.meta.url).href;
 const { Vault } = await import(new URL('vault.js', root));
@@ -10,6 +12,7 @@ const { CredentialSession, setSession } = await import(new URL('session.js', roo
 const { credentialsMenu, configureHttps } = await import(new URL('credentials.js', root));
 const { CredentialHelper } = await import(new URL('credential-helper.js', root));
 const { GithubClient, authenticateGithub } = await import(new URL('github.js', root));
+const { PersonalGithubClient } = await import(new URL('github-personal.js', root));
 const { Git, GitError } = await import(new URL('git.js', root));
 const { Console } = await import(new URL('ui.js', root));
 const TOKEN = 'synthetic_test_token_never_real';
@@ -148,4 +151,112 @@ test('managed authentication enrolls tokens explicitly, verifies actor, and neve
   assert.equal(g.calls.some((args) => args[0] === 'auth'), false);
   const mismatch = ghFixture(f, { login: 'bob' }); const ui = uiFixture(['0']); assert.equal(await authenticateGithub(ui.ui, mismatch.client, 'alice'), undefined); assert.equal(mismatch.calls.length, 1);
   await assert.rejects(mismatch.client.writeJson('PATCH', 'repos/acme/demo', {}), /不一致/u); assert.equal(mismatch.calls.some((args) => args[4] === 'PATCH'), false);
+});
+
+async function pinFixture(t, f) {
+  const request = (_options, listener) => {
+    const outgoing = new EventEmitter(); outgoing.destroy = () => outgoing;
+    outgoing.end = () => queueMicrotask(() => {
+      const response = new PassThrough(); response.statusCode = 200; response.headers = {}; response.complete = true;
+      listener(response); if (!response.destroyed) response.end('{"login":"Alice"}');
+    });
+    return outgoing;
+  };
+  const client = new PersonalGithubClient('alice', { request }); t.after(() => client.dispose());
+  assert.equal(await client.authenticate(uiFixture([]).ui), true);
+  return { client, pin: client.credentialPin() };
+}
+const helperCommand = (git) => git.orderedConfig.filter(([key, value]) => key === 'credential.helper' && value).map(([, value]) => value).join('');
+const credentialInput = (repositoryPath = 'Alice/Demo.git') => Buffer.from(`protocol=https\nhost=github.com\npath=${repositoryPath}\nusername=alice\n\n`);
+
+test('pinned HTTPS preserves the validated URL path case, isolates helper cache identities and rejects disposal or same-actor replacement', nativeTest, async (t) => {
+  const f = await fixture(t); await f.token(); const { client, pin } = await pinFixture(t, f);
+  const profile = { github_login: 'alice' }, target = { host: { host: 'github.com' }, url: 'https://github.com/Alice/Demo.git' };
+  const unpinned = await configureHttps(f.git, profile, target);
+  const first = await configureHttps(f.git, profile, { ...target, pin });
+  const cached = await configureHttps(f.git, profile, { ...target, pin });
+  const otherPin = client.credentialPin(), other = await configureHttps(f.git, profile, { ...target, pin: otherPin });
+  assert.notEqual(helperCommand(first), helperCommand(unpinned)); assert.equal(helperCommand(first), helperCommand(cached)); assert.notEqual(helperCommand(first), helperCommand(other));
+  const allowed = await first.run(['credential', 'fill'], { inputData: credentialInput() });
+  try { assert.equal(allowed.stdout.includes(Buffer.from(TOKEN)), true); }
+  finally { allowed.stdout.fill(0); }
+  const wrongCase = await first.run(['credential', 'fill'], { check: false, inputData: credentialInput('alice/demo.git') });
+  assert.notEqual(wrongCase.status, 0); assert.equal(wrongCase.stdout.includes(Buffer.from(TOKEN)), false);
+  await pin.dispose();
+  const disposed = await cached.run(['credential', 'fill'], { check: false, inputData: credentialInput() }); assert.notEqual(disposed.status, 0); assert.equal(disposed.stdout.includes(Buffer.from(TOKEN)), false);
+  await assert.rejects(configureHttps(f.git, profile, { ...target, pin }), /绑定已结束/u);
+  const replacement = 'synthetic_pinned_replacement_never_real'; await f.token('github.com', 'alice', replacement);
+  const swapped = await other.run(['credential', 'fill'], { check: false, inputData: credentialInput() });
+  assert.notEqual(swapped.status, 0); assert.equal(swapped.stdout.includes(Buffer.from(replacement)), false); assert.equal(swapped.stderr.includes(Buffer.from(replacement)), false);
+  await assert.rejects(configureHttps(f.git, profile, { ...target, pin: otherPin }), /Token 已变化/u);
+  const legacy = await unpinned.run(['credential', 'fill'], { inputData: credentialInput() });
+  try { assert.equal(legacy.stdout.includes(Buffer.from(replacement)), true); }
+  finally { legacy.stdout.fill(0); }
+});
+
+test('pinned HTTPS rejects actor/host mismatches and never guesses a repository scope', nativeTest, async (t) => {
+  const f = await fixture(t); await f.token(); const { pin } = await pinFixture(t, f);
+  await assert.rejects(configureHttps(f.git, { github_login: 'bob' }, { host: { host: 'github.com' }, url: 'https://github.com/Alice/Demo.git', pin }), /actor/u);
+  await assert.rejects(configureHttps(f.git, { github_login: 'alice' }, { host: { host: 'git.example.invalid' }, url: 'https://git.example.invalid/Alice/Demo.git', pin }), /host/u);
+  await assert.rejects(configureHttps(f.git, { github_login: 'alice' }, { host: { host: 'github.com' }, pin }), /唯一/u);
+});
+
+test('helper validates the exact buffer fetched during IPC, not a separate preflight that could miss a mid-fetch token swap', nativeTest, async (t) => {
+  const f = await fixture(t); await f.token(); const { pin } = await pinFixture(t, f);
+  const helper = await CredentialHelper.start({ session: f.session, host: 'github.com', account: 'alice', repositoryPath: 'Alice/Demo.git', pin });
+  const message = { protocol: 1, secret: helper.secret, operation: 'get', credential: { protocol: 'https', host: 'github.com', path: 'Alice/Demo.git', username: 'alice' } };
+  let entered, release; const began = new Promise((resolve) => { entered = resolve; }), gate = new Promise((resolve) => { release = resolve; });
+  const originalGetToken = f.session.getToken.bind(f.session), replacement = Buffer.from('synthetic_midfetch_replacement_never_real');
+  const fetched = [];
+  f.session.getToken = async (...args) => {
+    entered(); await gate; const token = await originalGetToken(...args); if (token) fetched.push(token); return token;
+  };
+  const pending = exchange(helper.endpoint, message);
+  await began; await f.session.storeToken('github.com', 'alice', replacement); release(); const result = await pending;
+  assert.equal(result.ok, false); assert.equal(result.password, undefined); assert.equal(fetched.length, 1); assert.equal(fetched[0].every((byte) => byte === 0), true);
+  f.session.getToken = originalGetToken; replacement.fill(0);
+});
+
+test('cached pinned and unpinned helpers reject a different current session, including a switch while getToken is pending', nativeTest, async (t) => {
+  const f = await fixture(t); await f.token(); const { pin } = await pinFixture(t, f);
+  const pinned = await CredentialHelper.start({ session: f.session, host: 'github.com', account: 'alice', repositoryPath: 'Alice/Demo.git', pin });
+  const unpinned = await CredentialHelper.start({ session: f.session, host: 'github.com', account: 'alice', repositoryPath: 'Alice/Demo.git' });
+  const message = (helper) => ({ protocol: 1, secret: helper.secret, operation: 'get', credential: { protocol: 'https', host: 'github.com', path: 'Alice/Demo.git', username: 'alice' } });
+  const source = Buffer.from(TOKEN); let entered, release;
+  const began = new Promise((resolve) => { entered = resolve; }), gate = new Promise((resolve) => { release = resolve; });
+  const originalGetToken = f.session.getToken.bind(f.session);
+  f.session.getToken = async () => { entered(); await gate; return source; };
+  const pending = exchange(pinned.endpoint, message(pinned)); await began;
+  setSession({ closed: false }); release();
+  const during = await pending; assert.equal(during.ok, false); assert.equal(during.password, undefined); assert.equal(source.every((byte) => byte === 0), true);
+  f.session.getToken = originalGetToken;
+  for (const helper of [pinned, unpinned]) {
+    const rejected = await exchange(helper.endpoint, message(helper)); assert.equal(rejected.ok, false); assert.equal(rejected.password, undefined); assert.equal(rejected.code, 'closed');
+  }
+  setSession(f.session);
+});
+
+test('task pin disposal closes its cached and direct helper sockets/directories without closing the credential session or unpinned helpers', nativeTest, async (t) => {
+  const f = await fixture(t); await f.token(); const { client, pin } = await pinFixture(t, f);
+  const profile = { github_login: 'alice' }, target = { host: { host: 'github.com' }, url: 'https://github.com/Alice/Demo.git' };
+  const root = join(dirname(f.directory), '.autogit-sessions');
+  const unpinned = await configureHttps(f.git, profile, target), before = new Set(await fs.readdir(root));
+  const pinned = await configureHttps(f.git, profile, { ...target, pin });
+  const direct = await CredentialHelper.start({ session: f.session, host: 'github.com', account: 'alice', repositoryPath: 'Alice/Demo.git', pin });
+  const owned = (await fs.readdir(root)).filter((name) => !before.has(name)); assert.equal(owned.length, 2);
+  const idle = connect(direct.endpoint); await new Promise((resolve, reject) => { idle.once('connect', resolve); idle.once('error', reject); });
+  const socketClosed = new Promise((resolve) => idle.once('close', resolve)); idle.resume();
+  const disposal = pin.dispose(); assert.equal(pin.dispose(), disposal); await disposal; await socketClosed;
+  assert.equal(f.session.closed, false); assert.throws(() => direct.command(), /关闭/u);
+  for (const name of owned) await assert.rejects(fs.stat(join(root, name)), { code: 'ENOENT' });
+  const denied = await pinned.run(['credential', 'fill'], { check: false, inputData: credentialInput() }); assert.notEqual(denied.status, 0); assert.equal(denied.stdout.includes(Buffer.from(TOKEN)), false);
+  const allowed = await unpinned.run(['credential', 'fill'], { inputData: credentialInput() });
+  try { assert.equal(allowed.stdout.includes(Buffer.from(TOKEN)), true); }
+  finally { allowed.stdout.fill(0); }
+  const freshPin = client.credentialPin(), fresh = await configureHttps(f.git, profile, { ...target, pin: freshPin });
+  assert.notEqual(helperCommand(fresh), helperCommand(pinned));
+  const freshOwned = (await fs.readdir(root)).filter((name) => !before.has(name)); assert.equal(freshOwned.length, 1);
+  const clientDisposal = client.dispose(); assert.equal(client.dispose(), clientDisposal); await clientDisposal;
+  for (const name of freshOwned) await assert.rejects(fs.stat(join(root, name)), { code: 'ENOENT' });
+  assert.equal(f.session.closed, false);
 });

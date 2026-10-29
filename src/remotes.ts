@@ -249,7 +249,12 @@ export async function remotesMenu(ui: Console, directory: string): Promise<void>
   if (!choice) return;
   if (choice === 1) {
     const names = await repo.remotes();
-    if (!names.length) ui.text('没有远程仓库。');
+    if (!names.length) {
+      ui.warn('当前项目尚未关联远程仓库，不能修改已有地址。请先新建或关联一个仓库。');
+      const name = await addRemote(ui, repo);
+      if (name) ui.success(`已添加远程：${name}。尚未上传代码。`);
+      return;
+    }
     for (const name of names) ui.text(`${name}\n  fetch: ${redact((await repo.remoteUrls(name)).join(', '))}\n  push: ${redact((await repo.remoteUrls(name, true)).join(', '))}`);
     const next = await ui.menu('远程操作', ['替换 fetch/push 地址列表', '逐项添加 / 移除 fetch/push 地址']);
     if (next === 1) await editRemoteUrls(ui, repo);

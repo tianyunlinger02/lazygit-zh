@@ -15,6 +15,99 @@ test('ask, menu and selection validate input, defaults and cancellation', async 
   assert.deepEqual(await ui.select(['a', 'b', 'c']), [0, 2]);
   await assert.rejects(ui.ask('cancel'), Cancelled);
 });
+test('diagnostics label severity and injected output remains plain by default', () => {
+  const messages = [], ui = new Console(undefined, message => messages.push(message));
+  ui.text('ordinary'); ui.error('failed'); ui.warn('partial'); ui.success('done');
+  assert.deepEqual(messages, ['ordinary', '[错误] failed', '[警告] partial', '[成功] done']);
+  assert.doesNotMatch(messages.join('\n'), /\x1b/u);
+  assert.equal(new Cancelled().message, '已返回'); assert.equal(new Cancelled().warning, false);
+  assert.equal(new Cancelled('partial', true).warning, true);
+});
+
+for (const [name, colorEnv, permitted] of [
+  ['default', {}, true], ['empty NO_COLOR', { NO_COLOR: '' }, true],
+  ['NO_COLOR', { NO_COLOR: '1' }, false], ['NO_COLOR zero', { NO_COLOR: '0' }, false],
+  ['NO_COLOR whitespace', { NO_COLOR: ' ' }, false], ['dumb terminal', { TERM: 'dumb' }, false],
+  ['FORCE_COLOR zero', { FORCE_COLOR: '0' }, false], ['FORCE_COLOR one', { FORCE_COLOR: '1' }, true],
+  ['force cannot override NO_COLOR', { FORCE_COLOR: '1', NO_COLOR: '1' }, false],
+  ['force cannot override dumb', { FORCE_COLOR: '1', TERM: 'dumb' }, false],
+  ['force zero suppresses xterm', { FORCE_COLOR: '0', TERM: 'xterm-256color' }, false],
+]) for (const diagnosticTty of [false, true]) {
+  test(`diagnostic color matrix: ${name}, TTY ${diagnosticTty}`, () => {
+    const messages = [], ui = new Console(undefined, message => messages.push(message), { diagnosticTty, colorEnv });
+    ui.error('failed'); ui.warn('partial'); ui.success('done');
+    const colored = diagnosticTty && permitted;
+    assert.deepEqual(messages, [
+      `${colored ? '\x1b[31m[错误]\x1b[39m' : '[错误]'} failed`,
+      `${colored ? '\x1b[33m[警告]\x1b[39m' : '[警告]'} partial`,
+      `${colored ? '\x1b[32m[成功]\x1b[39m' : '[成功]'} done`,
+    ]);
+    for (const message of messages) assert.equal((message.match(/\x1b\[39m/gu) ?? []).length, colored ? 1 : 0);
+  });
+}
+
+test('diagnostics escape hostile terminal controls before adding their own color and preserve text layout', () => {
+  for (const diagnosticTty of [false, true]) {
+    const messages = [], ui = new Console(undefined, message => messages.push(message), { diagnosticTty, colorEnv: {} });
+    const hostile = 'line\titem\n\x1b[31mred\x1b[0m\r\x00\x07\x7f\x9b32m';
+    ui.error(hostile); ui.warn(hostile); ui.success(hostile);
+    const safe = 'line\titem\n\\u001b[31mred\\u001b[0m\\u000d\\u0000\\u0007\\u007f\\u009b32m';
+    for (const [index, label] of ['错误', '警告', '成功'].entries()) {
+      assert.equal(messages[index], `${diagnosticTty ? `\x1b[${[31, 33, 32][index]}m[${label}]\x1b[39m` : `[${label}]`} ${safe}`);
+      assert.doesNotMatch(messages[index].replace(/\x1b\[(?:31|32|33|39)m/gu, ''), /[\x00-\x08\x0b-\x1f\x7f-\x9f]/u);
+    }
+  }
+});
+
+test('ordinary menus, titles, prompts and secrets stay uncolored even when diagnostics use color', async () => {
+  const messages = [], prompts = [], answers = ['answer', 'y', '1', '1'], secret = Buffer.from('synthetic-ui-only');
+  const ui = new Console(prompt => { prompts.push(prompt); return answers.shift(); }, message => messages.push(message), {
+    diagnosticTty: true, colorEnv: {}, secretInput: prompt => { prompts.push(prompt); return secret; },
+  });
+  ui.text('text'); ui.title('title'); assert.equal(await ui.ask('field'), 'answer');
+  assert.equal(await ui.confirm('confirm'), true); assert.equal(await ui.menu('menu', ['option']), 1);
+  assert.deepEqual(await ui.select(['option']), [0]); assert.equal(await ui.secret('secret'), secret);
+  assert.doesNotMatch([...messages, ...prompts].join('\n'), /\x1b|synthetic-ui-only/u);
+  secret.fill(0);
+});
+
+test('invalid ordinary input is explicitly an error, without changing injected prompts or ordinary output', async () => {
+  const ui = new ScriptedConsole(['', 'field', 'bad', 'y', 'bad', '0', 'bad', '1']);
+  assert.equal(await ui.ask('field'), 'field'); assert.equal(await ui.confirm('confirm'), true);
+  assert.equal(await ui.menu('menu', ['one']), 0); assert.deepEqual(await ui.select(['one']), [0]);
+  assert.deepEqual(ui.messages.filter(message => message.startsWith('[错误]')), [
+    '[错误] 此项不能为空；输入 :q 可返回。', '[错误] 请输入 y（是）或 n（否）。',
+    '[错误] 请输入 0 到 1 之间的编号。', '[错误] 编号无效，请重新选择；不会修改任何文件。',
+  ]);
+  assert.doesNotMatch(ui.transcript, /\x1b/u);
+});
+
+test('production diagnostic auto-detection follows stdout, not stdin, and injected writers do not inherit it', async t => {
+  const f = await fixture(t), module = new URL('../dist/ui.js', import.meta.url).href;
+  const env = { ...process.env, TERM: 'xterm-256color' }; delete env.NO_COLOR; delete env.FORCE_COLOR;
+  for (const [stdinTty, stdoutTty] of [[true, false], [false, true]]) {
+    const script = `import{Console}from ${JSON.stringify(module)};Object.defineProperty(process.stdin,'isTTY',{value:${stdinTty}});Object.defineProperty(process.stdout,'isTTY',{value:${stdoutTty}});new Console().error('production');new Console(undefined,message=>process.stdout.write(message+'\\n')).warn('injected');`;
+    const result = await runProcess(process.execPath, ['--input-type=module', '-e', script], { cwd: f.base, env, inputData: Buffer.alloc(0) });
+    assert.equal(result.status, 0, result.stderr.toString());
+    assert.equal(result.stdout.toString(), `${stdoutTty ? '\x1b[31m[错误]\x1b[39m' : '[错误]'} production\n[警告] injected\n`);
+  }
+});
+
+test('real PTY diagnostics honor color suppression without coloring ordinary output', { skip: process.platform === 'win32' || !which('script'), timeout: 15000 }, async t => {
+  const f = await fixture(t), module = new URL('../dist/ui.js', import.meta.url).href, driver = join(f.base, 'diagnostic-driver.mjs');
+  await writeFile(driver, `import{Console}from ${JSON.stringify(module)};const ui=new Console();ui.error('failure');ui.warn('partial');ui.success('complete');ui.text('ORDINARY_END');`);
+  const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
+  const baseEnv = { ...process.env, TERM: 'xterm-256color' }; delete baseEnv.NO_COLOR; delete baseEnv.FORCE_COLOR;
+  for (const [overrides, colored] of [[{}, true], [{ NO_COLOR: '1' }, false], [{ TERM: 'dumb' }, false], [{ FORCE_COLOR: '0' }, false]]) {
+    const result = await runProcess('script', ['-q', '-e', '-c', `${quote(process.execPath)} ${quote(driver)}`, '/dev/null'], { cwd: f.base, env: { ...baseEnv, ...overrides }, inputData: Buffer.alloc(0) });
+    assert.equal(result.status, 0, result.stderr.toString());
+    const text = result.stdout.toString();
+    for (const [label, code] of [['错误', 31], ['警告', 33], ['成功', 32]]) assert.ok(text.includes(colored ? `\x1b[${code}m[${label}]\x1b[39m` : `[${label}]`), text);
+    if (!colored) assert.doesNotMatch(text, /\x1b/u);
+    assert.match(text, /complete\r?\nORDINARY_END\r?\n/u);
+  }
+});
+
 test('multiline preserves exact whitespace, empty lines and embedded punctuation until a standalone dot', async () => {
   const ui = new ScriptedConsole(['  subject  ', '', '  indented body  ', ' . ', ':q is literal text', '.', 'next']);
   assert.equal(await ui.multiline('message'), '  subject  \n\n  indented body  \n . \n:q is literal text');

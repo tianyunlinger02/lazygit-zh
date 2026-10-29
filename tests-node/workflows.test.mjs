@@ -4,8 +4,8 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { Change, Git, GitError, decodePath, encodePath } from '../dist/git.js';
-import { GithubClient } from '../dist/github.js';
-import { DEFAULT_HOST, HostStore } from '../dist/hosts.js';
+import { mockPersonalGithub } from './personal-support.mjs';
+import { DEFAULT_HOST, DEFAULT_TRANSPORT, HostStore } from '../dist/hosts.js';
 import { Profile, ProfileStore, resolveBinding } from '../dist/profiles.js';
 import {
   addRemote, chooseDirectory, clone, inspect, protectAccountData, pull, push,
@@ -21,29 +21,10 @@ async function prepared(t) {
   return { ...f, target };
 }
 
-function mockGithub(t, initialLogin = 'fixture-login') {
-  const state = { login: initialLogin, available: 0, logins: 0, switches: [], browsers: 0, creates: [], afterCreated: undefined, createError: undefined, remoteAddError: undefined };
-  t.mock.method(GithubClient.prototype, 'ensureAvailable', () => { state.available++; });
-  t.mock.method(GithubClient.prototype, 'currentLogin', async () => { state.logins++; return state.login; });
-  t.mock.method(GithubClient.prototype, 'switchAccount', async (login) => { state.switches.push(login); state.login = login; });
-  t.mock.method(GithubClient.prototype, 'browserLogin', async () => { state.browsers++; throw new Error('unexpected browser login in offline test'); });
-  t.mock.method(GithubClient.prototype, 'createRepository', async (owner, name, visibility, onCreated) => {
-    assert.equal(state.login.toLowerCase(), owner.toLowerCase(), 'workflow must authenticate the expected actor');
-    state.creates.push({ owner, name, visibility });
-    const created = {
-      owner, name, private: visibility === 'private', htmlUrl: `https://github.com/${owner}/${name}`,
-      sshUrl: `git@github.com:${owner}/${name}.git`, httpsUrl: `https://github.com/${owner}/${name}.git`,
-    };
-    onCreated?.(created.htmlUrl);
-    if (state.afterCreated) await state.afterCreated(created);
-    if (state.createError) throw state.createError;
-    return created;
-  });
-  return state;
-}
-
 async function managedCreation(t, { bound = false, login = 'fixture-login' } = {}) {
   const f = await fixture(t);
+  // Legacy SSH coverage is explicit; unconfigured-project choices are tested separately.
+  await new HostStore().set(f.path, DEFAULT_TRANSPORT);
   const store = new ProfileStore();
   const id = 'a'.repeat(32);
   const folder = path.join(store.profilesDir, id);
@@ -59,7 +40,7 @@ async function managedCreation(t, { bound = false, login = 'fixture-login' } = {
   });
   await writeFile(path.join(folder, 'profile.json'), JSON.stringify(store.encodeProfile(profile)), { mode: 0o600 });
   if (bound) await store.bind(f.path, profile.profile_id);
-  const api = mockGithub(t, login);
+  const api = mockPersonalGithub(t, login);
   const transports = new Map();
   const pushes = [];
   const gitCalls = [];
@@ -556,6 +537,24 @@ test('add remote can be declined and never overwrites existing configuration', a
   assert.deepEqual(await f.git.remoteUrls('origin'), [target]);
 });
 
+test('manual existing-repository branch refuses an origin collision introduced during final confirmation', async (t) => {
+  const f = await fixture(t);
+  const api = mockPersonalGithub(t);
+  const retained = 'https://github.com/other/retained.git';
+  const ui = new ScriptedConsole(['2', 'https://github.com/person/intended.git', '', 'y']);
+  const confirm = ui.routineConfirm.bind(ui);
+  ui.routineConfirm = async (...args) => {
+    const result = await confirm(...args);
+    await f.git.run(['remote', 'add', 'origin', retained]);
+    return result;
+  };
+  await assert.rejects(addRemote(ui, f.git), /没有覆盖/u);
+  assert.deepEqual(await f.git.remoteUrls('origin'), [retained]);
+  assert.equal(api.authentications, 0);
+  assert.deepEqual(api.creates, []);
+  assert.deepEqual(ui.answers, []);
+});
+
 test('manual add remote accepts generic Git transports without networking and rejects unsafe addresses', async t => {
   const f = await fixture(t);
   const run = Git.prototype.run;
@@ -583,10 +582,10 @@ test('add remote rejects a name that could become a command-line option', async 
 });
 
 for (const [visibility, selection, bound, quick] of [['private', '1', false, true], ['public', '2', true, false]]) {
-  test(`create ${visibility} personal repository only links canonical SSH and never commits or pushes`, async (t) => {
+  test(`code-only native API stub creates ${visibility} personal repository, links canonical SSH and never commits or pushes`, async (t) => {
     const f = await managedCreation(t, { bound });
     await f.write();
-    const answers = ['1', '', ...(!bound ? ['1'] : []), 'Explicit_Repo', selection, 'y'];
+    const answers = ['1', ...(!bound ? ['1'] : []), 'Explicit_Repo', selection, 'y'];
     const ui = new ScriptedConsole(answers, { quick });
     const result = await addRemote(ui, f.git);
     assert.equal(result, 'origin');
@@ -599,20 +598,60 @@ for (const [visibility, selection, bound, quick] of [['private', '1', false, tru
     assert.ok(!f.gitCalls.some((args) => args[0] === 'commit'));
     assert.match(ui.transcript, /GitHub API 登录：fixture-login/u);
     assert.match(ui.transcript, /AutoGit 账号：Offline Profile/u);
-    assert.match(ui.transcript, /预期登录 \/ 仓库所有者：fixture-login/u);
+    assert.match(ui.transcript, /GitHub API 账号 \/ 仓库所有者：fixture-login/u);
     assert.match(ui.transcript, new RegExp(`可见性：${visibility}`, 'u'));
     assert.ok(ui.transcript.includes(`项目：${f.path}`));
-    assert.match(ui.transcript, /本地远程名：origin/u);
-    assert.match(ui.transcript, /空仓库，不添加 README、\.gitignore 或许可证/u);
+    assert.match(ui.transcript, /本地远程别名：origin/u);
+    assert.match(ui.transcript, /空仓库，不添加 README、\.gitignore、许可证或初始提交/u);
     assert.match(ui.transcript, /最终确认.*\[y\/N\]/u);
     assert.match(ui.transcript, /GitHub 仓库已创建：https:\/\/github\.com\/fixture-login\/Explicit_Repo/u);
+    assert.deepEqual(f.api.ghCalls, []);
+    assert.equal(f.api.authentications, 1);
+    assert.doesNotMatch(ui.transcript, /给这个远程起一个名字/u);
+    assert.deepEqual(ui.answers, []);
+  });
+}
+
+test('unconfigured personal creation explicitly chooses and saves SSH without silently adopting a default', async t => {
+  const f = await managedCreation(t);
+  await new HostStore().set(f.path, undefined);
+  const ui = new ScriptedConsole(['1', '2', '1', 'explicit-ssh-choice', '1', 'y'], { quick: true });
+  assert.equal(await addRemote(ui, f.git), 'origin');
+  assert.deepEqual(await new HostStore().get(f.path), DEFAULT_TRANSPORT);
+  assert.deepEqual(await f.git.remoteUrls('origin'), ['git@github.com:fixture-login/explicit-ssh-choice.git']);
+  assert.deepEqual(f.api.creates, [{ owner: 'fixture-login', name: 'explicit-ssh-choice', visibility: 'private' }]);
+  assert.match(ui.transcript, /HTTPS.*推荐/u);
+  assert.match(ui.transcript, /托管 SSH/u);
+  assert.equal(f.pushes.length, 0);
+  assert.deepEqual(ui.answers, []);
+});
+
+for (const [label, target] of [
+  ['external HTTPS', { mode: 'https', host: DEFAULT_HOST, credentials: 'external' }],
+  ['native SSH', { mode: 'native-ssh', host: DEFAULT_HOST }],
+  ['GitHub Enterprise', { mode: 'managed-ssh', host: { provider: 'github-enterprise', host: 'github.example.invalid', apiHost: 'github.example.invalid', webBase: 'https://github.example.invalid', sshHost: 'github.example.invalid' } }],
+]) {
+  test(`personal creation refuses ${label} transport before native authentication or repository creation`, async (t) => {
+    const f = await managedCreation(t);
+    const hosts = new HostStore();
+    await hosts.set(f.path, target);
+    const ui = new ScriptedConsole(['1']);
+    await assert.rejects(addRemote(ui, f.git), /github\.com.*(?:托管 HTTPS|托管 SSH).*尚未创建仓库/u);
+    assert.equal(f.api.authentications, 0);
+    assert.equal(f.api.logins, 0);
+    assert.deepEqual(f.api.creates, []);
+    assert.deepEqual(f.api.ghCalls, []);
+    assert.deepEqual(await hosts.get(f.path), target);
+    assert.deepEqual(await f.git.remotes(), []);
+    assert.equal(await resolveBinding(f.path), undefined);
+    assert.doesNotMatch(ui.transcript, /GitHub 仓库名称|仓库可见性|远程别名|最终确认/u);
     assert.deepEqual(ui.answers, []);
   });
 }
 
 test('quick mode final hard confirmation can cancel after authentication without creating or binding', async (t) => {
   const f = await managedCreation(t);
-  const ui = new ScriptedConsole(['1', '', '1', 'cancel-create', '1', 'n'], { quick: true });
+  const ui = new ScriptedConsole(['1', '1', 'cancel-create', '1', 'n'], { quick: true });
   assert.equal(await addRemote(ui, f.git), '');
   assert.ok(f.api.logins > 0);
   assert.deepEqual(f.api.creates, []);
@@ -622,9 +661,9 @@ test('quick mode final hard confirmation can cancel after authentication without
   assert.deepEqual(ui.answers, []);
 });
 
-test('read-only creation authentication needs no extra consent but final server write remains hard-confirmed', async (t) => {
+test('code-only native authentication success adds no duplicate consent while final server write remains hard-confirmed', async (t) => {
   const f = await managedCreation(t);
-  const ui = new ScriptedConsole(['1', '', '1', 'no-network', '1', 'n'], { quick: true });
+  const ui = new ScriptedConsole(['1', '1', 'no-network', '1', 'n'], { quick: true });
   assert.equal(await addRemote(ui, f.git), '');
   assert.ok(f.api.logins > 0);
   assert.equal(ui.messages.filter(message => message.includes('[y/N]')).length, 1);
@@ -634,65 +673,131 @@ test('read-only creation authentication needs no extra consent but final server 
   assert.deepEqual(ui.answers, []);
 });
 
-test('creation without an available profile returns before any GitHub call', async (t) => {
+test('creation without an available profile returns before any GitHub call or remote-name prompt', async (t) => {
   const f = await fixture(t);
-  const api = mockGithub(t);
-  const ui = new ScriptedConsole(['1', '']);
+  await new HostStore().set(f.path, DEFAULT_TRANSPORT);
+  const api = mockPersonalGithub(t);
+  const ui = new ScriptedConsole(['1']);
   assert.equal(await addRemote(ui, f.git), '');
-  assert.equal(api.available, 0);
+  assert.equal(api.authentications, 0);
   assert.equal(api.logins, 0);
   assert.deepEqual(api.creates, []);
   assert.deepEqual(await f.git.remotes(), []);
   assert.match(ui.transcript, /未选择 AutoGit 账号/u);
+  assert.doesNotMatch(ui.transcript, /远程别名|给这个远程起一个名字|GitHub 仓库名称/u);
   assert.deepEqual(ui.answers, []);
 });
 
-test('cancelling creation menu, profile, or visibility has no API or binding side effects', async (t) => {
+test('cancelling creation menu or profile avoids authentication; visibility cancellation occurs after native authentication', async (t) => {
   const f = await managedCreation(t);
-  for (const answers of [['0'], ['1', '', '0'], ['1', '', '1', 'cancel-visibility', '0']]) {
+  for (const answers of [['0'], ['1', '0']]) {
     const ui = new ScriptedConsole(answers);
     assert.equal(await addRemote(ui, f.git), '');
     assert.deepEqual(ui.answers, []);
+    assert.equal(f.api.authentications, 0);
   }
-  assert.equal(f.api.logins, 0);
+  const ui = new ScriptedConsole(['1', '1', 'cancel-visibility', '0']);
+  assert.equal(await addRemote(ui, f.git), '');
+  assert.equal(f.api.authentications, 1);
+  assert.equal(f.api.logins, 1);
   assert.deepEqual(f.api.creates, []);
   assert.deepEqual(await f.git.remotes(), []);
   assert.equal(await resolveBinding(f.path), undefined);
-});
-
-test('creation rejects invalid remote ref names and collisions before any API call', async (t) => {
-  const f = await managedCreation(t);
-  for (const remote of ['--mirror', 'bad..name', 'bad[name', 'trailing.lock']) {
-    const ui = new ScriptedConsole(['1', remote]);
-    await assert.rejects(addRemote(ui, f.git), /远程名/u);
-    assert.deepEqual(ui.answers, []);
-  }
-  const target = await f.remote();
-  const ui = new ScriptedConsole(['1', '']);
-  await assert.rejects(addRemote(ui, f.git), /没有覆盖/u);
-  assert.deepEqual(await f.git.remoteUrls('origin'), [target]);
-  assert.equal(f.api.available, 0);
-  assert.equal(f.api.logins, 0);
-  assert.deepEqual(f.api.creates, []);
+  assert.doesNotMatch(ui.transcript, /最终确认|新地址的本地远程别名|本地远程别名自动使用/u);
   assert.deepEqual(ui.answers, []);
 });
 
-test('creation requires an explicit valid repository name and does not sanitize the Chinese directory name', async (t) => {
+test('native authentication cancellation returns before repository name, visibility or remote-name prompts', async (t) => {
   const f = await managedCreation(t);
-  for (const name of ['中文仓库', 'bad/name', '-option', '..', 'repo.git']) {
-    const ui = new ScriptedConsole(['1', '', '1', name]);
-    await assert.rejects(addRemote(ui, f.git), /仓库/u);
-    assert.match(ui.transcript, /不自动使用文件夹名/u);
-    assert.deepEqual(ui.answers, []);
-  }
-  assert.equal(f.api.logins, 0);
+  f.api.authenticateResult = false;
+  const ui = new ScriptedConsole(['1', '1']);
+  assert.equal(await addRemote(ui, f.git), '');
+  assert.equal(f.api.authentications, 1);
   assert.deepEqual(f.api.creates, []);
   assert.deepEqual(await f.git.remotes(), []);
+  assert.equal(await resolveBinding(f.path), undefined);
+  assert.doesNotMatch(ui.transcript, /GitHub 仓库名称|仓库可见性|远程别名|最终确认/u);
+  assert.deepEqual(ui.answers, []);
+});
+
+test('creation loops over invalid and occupied remote aliases after authentication without overwriting origin', async (t) => {
+  const f = await managedCreation(t);
+  const target = await f.remote();
+  const ui = new ScriptedConsole(['1', '1', 'new-remote-project', '1', '--mirror', 'bad..name', 'bad[name', 'trailing.lock', 'origin', '', 'y']);
+  assert.equal(await addRemote(ui, f.git), 'origin-2');
+  assert.deepEqual(await f.git.remoteUrls('origin'), [target]);
+  assert.deepEqual(await f.git.remoteUrls('origin-2'), ['git@github.com:fixture-login/new-remote-project.git']);
+  assert.equal(f.api.authentications, 1);
+  assert.deepEqual(f.api.creates, [{ owner: 'fixture-login', name: 'new-remote-project', visibility: 'private' }]);
+  assert.match(ui.transcript, /新地址的本地远程别名 \[origin-2\]/u);
+  assert.match(ui.transcript, /远程名无效/u);
+  assert.match(ui.transcript, /没有覆盖/u);
+  assert.deepEqual(ui.answers, []);
+});
+
+test('creation proposes the next unique origin alias and preserves all existing remotes', async (t) => {
+  const f = await managedCreation(t, { bound: true });
+  const target = await f.remote();
+  await f.git.run(['remote', 'add', 'origin-2', target]);
+  const ui = new ScriptedConsole(['1', 'another-project', '2', '', 'y']);
+  assert.equal(await addRemote(ui, f.git), 'origin-3');
+  assert.match(ui.transcript, /新地址的本地远程别名 \[origin-3\]/u);
+  assert.deepEqual(await f.git.remoteUrls('origin'), [target]);
+  assert.deepEqual(await f.git.remoteUrls('origin-2'), [target]);
+  assert.deepEqual(await f.git.remoteUrls('origin-3'), ['git@github.com:fixture-login/another-project.git']);
+  assert.equal(f.api.authentications, 1);
+  assert.deepEqual(ui.answers, []);
+});
+
+test('creation loops over invalid repository names without sanitizing an invalid Chinese basename', async (t) => {
+  const f = await managedCreation(t);
+  const invalid = ['中文仓库', 'bad/name', '-option', '..', 'repo.git'];
+  const ui = new ScriptedConsole(['1', '1', '', ...invalid, 'Valid_Repo', '1', 'y']);
+  let namesAsked = 0;
+  const ask = ui.ask.bind(ui);
+  ui.ask = async (prompt, defaultValue) => {
+    if (prompt.startsWith('GitHub 仓库名称')) {
+      namesAsked++;
+      assert.equal(defaultValue, '', 'invalid basename must not be sanitized into a suggested name');
+      assert.equal(f.api.authentications, 1, 'native actor authentication must precede repository-name input');
+    }
+    return ask(prompt, defaultValue);
+  };
+  assert.equal(await addRemote(ui, f.git), 'origin');
+  assert.equal(namesAsked, invalid.length + 1);
+  assert.match(ui.transcript, /不会自动改写文件夹名/u);
+  assert.match(ui.transcript, /此项不能为空/u);
+  assert.match(ui.transcript, /仓库名不能带 \.git 后缀/u);
+  assert.deepEqual(f.api.creates, [{ owner: 'fixture-login', name: 'Valid_Repo', visibility: 'private' }]);
+  assert.deepEqual(ui.answers, []);
+});
+
+test('creation accepts a legal project basename by pressing Enter without an unused-origin prompt', async (t) => {
+  const f = await managedCreation(t);
+  const directory = path.join(f.base, 'Legal_Project-1.0');
+  await rename(f.path, directory);
+  await new HostStore().set(directory, DEFAULT_TRANSPORT);
+  const repo = new Git(directory);
+  const ui = new ScriptedConsole(['1', '1', '', '1', 'y']);
+  const ask = ui.ask.bind(ui);
+  ui.ask = async (prompt, defaultValue) => {
+    if (prompt.startsWith('GitHub 仓库名称')) {
+      assert.equal(defaultValue, 'Legal_Project-1.0');
+      assert.equal(f.api.authentications, 1);
+    }
+    assert.doesNotMatch(prompt, /远程别名|给这个远程起一个名字/u);
+    return ask(prompt, defaultValue);
+  };
+  assert.equal(await addRemote(ui, repo), 'origin');
+  assert.deepEqual(f.api.creates, [{ owner: 'fixture-login', name: 'Legal_Project-1.0', visibility: 'private' }]);
+  assert.deepEqual(await repo.remoteUrls('origin'), ['git@github.com:fixture-login/Legal_Project-1.0.git']);
+  assert.equal((await resolveBinding(directory)).profile_id, f.profile.profile_id);
+  assert.deepEqual(ui.answers, []);
 });
 
 test('creation rechecks remote uniqueness after the final hard confirmation', async (t) => {
   const f = await managedCreation(t);
-  const ui = new ScriptedConsole(['1', '', '1', 'race-remote', '1', 'y']);
+  const ui = new ScriptedConsole(['1', '1', 'race-remote', '1', 'y']);
   const confirm = ui.confirm.bind(ui);
   ui.confirm = async (prompt, ...args) => {
     const result = await confirm(prompt, ...args);
@@ -706,9 +811,24 @@ test('creation rechecks remote uniqueness after the final hard confirmation', as
   assert.deepEqual(ui.answers, []);
 });
 
+test('creation rechecks transport after native actor precheck immediately before the server write', async (t) => {
+  const f = await managedCreation(t);
+  const hosts = new HostStore();
+  f.api.beforeCreateWrite = async () => hosts.set(f.path, { mode: 'https', host: DEFAULT_HOST });
+  const ui = new ScriptedConsole(['1', '1', 'transport-race', '1', 'y']);
+  await assert.rejects(addRemote(ui, f.git), /传输配置.*发生变化/u);
+  assert.equal(f.api.authentications, 1);
+  assert.equal(f.api.logins, 2, 'the native API stub must model its actor precheck before the write guard');
+  assert.deepEqual(f.api.creates, []);
+  assert.deepEqual(await f.git.remotes(), []);
+  assert.equal(await resolveBinding(f.path), undefined);
+  assert.deepEqual(await hosts.get(f.path), { mode: 'https', host: DEFAULT_HOST });
+  assert.deepEqual(ui.answers, []);
+});
+
 test('creation rechecks profile snapshot after confirmation and never silently rebinds', async (t) => {
   const f = await managedCreation(t);
-  const ui = new ScriptedConsole(['1', '', '1', 'race-profile', '1', 'y']);
+  const ui = new ScriptedConsole(['1', '1', 'race-profile', '1', 'y']);
   const confirm = ui.confirm.bind(ui);
   ui.confirm = async (prompt, ...args) => {
     const result = await confirm(prompt, ...args);
@@ -727,7 +847,7 @@ test('creation rechecks profile snapshot after confirmation and never silently r
 
 test('creation rechecks an independently changed project binding before server write', async (t) => {
   const f = await managedCreation(t);
-  const ui = new ScriptedConsole(['1', '', '1', 'race-binding', '1', 'y']);
+  const ui = new ScriptedConsole(['1', '1', 'race-binding', '1', 'y']);
   const confirm = ui.confirm.bind(ui);
   ui.confirm = async (prompt, ...args) => {
     const result = await confirm(prompt, ...args);
@@ -741,35 +861,36 @@ test('creation rechecks an independently changed project binding before server w
   assert.deepEqual(ui.answers, []);
 });
 
-test('creation uses explicit account-switch helper and rechecks expected API login before final confirmation', async (t) => {
+test('native actor mismatch stops a bound personal creation before draft prompts without automatic gh switching', async (t) => {
   const f = await managedCreation(t, { bound: true, login: 'other-user' });
-  const ui = new ScriptedConsole(['1', '', 'switched-project', '1', '1', 'y'], { quick: true });
-  assert.equal(await addRemote(ui, f.git), 'origin');
-  assert.deepEqual(f.api.switches, ['fixture-login']);
-  assert.equal(f.api.logins, 2);
-  assert.deepEqual(f.api.creates, [{ owner: 'fixture-login', name: 'switched-project', visibility: 'private' }]);
+  const ui = new ScriptedConsole(['1'], { quick: true });
+  await assert.rejects(addRemote(ui, f.git), /登录账号.*不一致.*不会自动切换账号/u);
+  assert.equal(f.api.authentications, 1);
+  assert.deepEqual(f.api.ghCalls, []);
+  assert.deepEqual(f.api.creates, []);
+  assert.deepEqual(await f.git.remotes(), []);
   assert.equal((await resolveBinding(f.path)).profile_id, f.profile.profile_id);
-  assert.match(ui.transcript, /不会使用错误账号继续/u);
-  assert.match(ui.transcript, /改变外部 gh 的默认账号/u);
-  assert.equal(ui.messages.filter(message => message.includes('[y/N]')).length, 1);
-  assert.match(ui.transcript, /GitHub API 登录：fixture-login/u);
+  assert.doesNotMatch(ui.transcript, /GitHub 仓库名称|仓库可见性|最终确认|改变外部 gh/u);
   assert.deepEqual(ui.answers, []);
 });
 
-test('creation cannot proceed on mismatched account when user cancels explicit authentication choice', async (t) => {
-  const f = await managedCreation(t, { login: 'other-user' });
-  const ui = new ScriptedConsole(['1', '', '1', 'wrong-actor', '1', '0']);
-  assert.equal(await addRemote(ui, f.git), '');
-  assert.deepEqual(f.api.switches, []);
+test('native authentication failure leaves an unbound project untouched before name and visibility', async (t) => {
+  const f = await managedCreation(t);
+  f.api.authenticateError = new GitError('native authentication fixture failed');
+  const ui = new ScriptedConsole(['1', '1']);
+  await assert.rejects(addRemote(ui, f.git), /native authentication fixture failed/u);
+  assert.equal(f.api.authentications, 1);
+  assert.deepEqual(f.api.ghCalls, []);
   assert.deepEqual(f.api.creates, []);
   assert.deepEqual(await f.git.remotes(), []);
   assert.equal(await resolveBinding(f.path), undefined);
+  assert.doesNotMatch(ui.transcript, /GitHub 仓库名称|仓库可见性|最终确认/u);
   assert.deepEqual(ui.answers, []);
 });
 
 test('creation stops if a Git operation starts during final confirmation', async (t) => {
   const f = await managedCreation(t);
-  const ui = new ScriptedConsole(['1', '', '1', 'operation-started', '1', 'y']);
+  const ui = new ScriptedConsole(['1', '1', 'operation-started', '1', 'y']);
   const confirm = ui.confirm.bind(ui);
   ui.confirm = async (prompt, ...args) => {
     const result = await confirm(prompt, ...args);
@@ -785,11 +906,12 @@ test('creation stops if a Git operation starts during final confirmation', async
 
 test('created URL is printed immediately even when subsequent repository metadata validation fails', async (t) => {
   const f = await managedCreation(t);
-  const ui = new ScriptedConsole(['1', '', '1', 'metadata-fails', '1', 'y']);
+  const ui = new ScriptedConsole(['1', '1', 'metadata-fails', '1', 'y']);
   f.api.afterCreated = async () => assert.match(ui.transcript, /GitHub 仓库已创建：https:\/\/github\.com\/fixture-login\/metadata-fails/u);
   f.api.createError = new GitError('simulated metadata validation failure');
   await assert.rejects(addRemote(ui, f.git), /metadata validation/u);
-  assert.match(ui.transcript, /本地远程尚未关联.*不自动删除或回滚/u);
+  assert.match(ui.transcript, /仓库创建：已完成/u);
+  assert.match(ui.transcript, /本地关联：未执行|本地关联：失败/u);
   assert.deepEqual(await f.git.remotes(), []);
   assert.equal(await resolveBinding(f.path), undefined);
   assert.deepEqual(ui.answers, []);
@@ -798,10 +920,11 @@ test('created URL is printed immediately even when subsequent repository metadat
 test('created repository survives remote-add failure and reports completed stage and URL', async (t) => {
   const f = await managedCreation(t);
   f.api.remoteAddError = new GitError('simulated remote-add failure');
-  const ui = new ScriptedConsole(['1', '', '1', 'link-fails', '1', 'y']);
+  const ui = new ScriptedConsole(['1', '1', 'link-fails', '1', 'y']);
   await assert.rejects(addRemote(ui, f.git), /remote-add failure/u);
   assert.match(ui.transcript, /GitHub 仓库已创建：https:\/\/github\.com\/fixture-login\/link-fails/u);
-  assert.match(ui.transcript, /本地远程尚未关联.*不自动删除或回滚/u);
+  assert.match(ui.transcript, /仓库创建：已完成/u);
+  assert.match(ui.transcript, /本地关联：未执行|本地关联：失败/u);
   assert.deepEqual(await f.git.remotes(), []);
   assert.equal(await resolveBinding(f.path), undefined);
   assert.equal(f.pushes.length, 0);
@@ -811,10 +934,11 @@ test('created repository survives remote-add failure and reports completed stage
 test('created and linked repository survives binding failure without deletion or push', async (t) => {
   const f = await managedCreation(t);
   t.mock.method(ProfileStore.prototype, 'bind', async () => { throw new GitError('simulated binding failure'); });
-  const ui = new ScriptedConsole(['1', '', '1', 'bind-fails', '1', 'y']);
+  const ui = new ScriptedConsole(['1', '1', 'bind-fails', '1', 'y']);
   await assert.rejects(addRemote(ui, f.git), /binding failure/u);
   assert.match(ui.transcript, /GitHub 仓库已创建：https:\/\/github\.com\/fixture-login\/bind-fails/u);
-  assert.match(ui.transcript, /本地远程已关联为 origin.*不自动删除或回滚/u);
+  assert.match(ui.transcript, /本地关联：部分完成/u);
+  assert.match(ui.transcript, /不会自动删除或回滚/u);
   assert.deepEqual(await f.git.remoteUrls('origin'), ['git@github.com:fixture-login/bind-fails.git']);
   assert.equal(await resolveBinding(f.path), undefined);
   assert.equal(f.pushes.length, 0);
@@ -825,12 +949,13 @@ for (const direction of ['insteadOf', 'pushInsteadOf']) {
   test(`created repository refuses rewritten ${direction} destination and retains completed stages`, async (t) => {
     const f = await managedCreation(t);
     await f.git.run(['config', `url.git@github.com:unexpected-owner/.${direction}`, 'git@github.com:fixture-login/']);
-    const ui = new ScriptedConsole(['1', '', '1', 'wrong-target', '1', 'y']);
+    const ui = new ScriptedConsole(['1', '1', 'wrong-target', '1', 'y']);
     await assert.rejects(addRemote(ui, f.git), /实际获取\/推送目标.*拒绝继续上传/u);
     assert.equal(f.api.creates.length, 1);
     assert.equal(await f.git.config('remote.origin.url'), 'git@github.com:fixture-login/wrong-target.git');
     assert.match(ui.transcript, /GitHub 仓库已创建：https:\/\/github\.com\/fixture-login\/wrong-target/u);
-    assert.match(ui.transcript, /本地远程已关联为 origin.*不自动删除或回滚/u);
+    assert.match(ui.transcript, /本地关联：部分完成/u);
+  assert.match(ui.transcript, /不会自动删除或回滚/u);
     assert.equal(await resolveBinding(f.path), undefined);
     assert.equal(f.pushes.length, 0);
     assert.deepEqual(ui.answers, []);
@@ -840,12 +965,13 @@ for (const direction of ['insteadOf', 'pushInsteadOf']) {
 test('created repository rejects even same-owner SSH-to-HTTPS rewrites instead of using external credentials', async (t) => {
   const f = await managedCreation(t);
   await f.git.run(['config', 'url.https://github.com/.insteadOf', 'git@github.com:']);
-  const ui = new ScriptedConsole(['1', '', '1', 'same-target', '1', 'y']);
-  await assert.rejects(addRemote(ui, f.git), /HTTPS.*不能改用外部 HTTPS 凭据/u);
+  const ui = new ScriptedConsole(['1', '1', 'same-target', '1', 'y']);
+  await assert.rejects(addRemote(ui, f.git), /不能换协议.*外部凭据|HTTPS.*不能改用外部 HTTPS 凭据/u);
   assert.equal(f.api.creates.length, 1);
   assert.equal(await f.git.config('remote.origin.url'), 'git@github.com:fixture-login/same-target.git');
   assert.match(ui.transcript, /GitHub 仓库已创建：https:\/\/github\.com\/fixture-login\/same-target/u);
-  assert.match(ui.transcript, /本地远程已关联为 origin.*不自动删除或回滚/u);
+  assert.match(ui.transcript, /本地关联：部分完成/u);
+  assert.match(ui.transcript, /不会自动删除或回滚/u);
   assert.equal(await resolveBinding(f.path), undefined);
   assert.equal(f.pushes.length, 0);
   assert.deepEqual(ui.answers, []);
@@ -868,7 +994,7 @@ test('new target is propagated through uploadLocal saveAndPush and push despite 
   await f.git.run(['config', 'remote.pushDefault', 'origin']);
   await f.write('only-chosen.txt', 'one-time target\n');
   f.transports.set('chosen', chosen);
-  const ui = new ScriptedConsole(['2', '1', 'chosen', 'chosen-project', '1', 'y', 'a', 'upload only chosen', 'y', 'y', '', 'y']);
+  const ui = new ScriptedConsole(['2', '1', 'chosen-project', '1', 'chosen', 'y', 'a', 'upload only chosen', 'y', 'y', '', 'y']);
   assert.equal(await uploadLocal(ui, f.path, { selectDirectory: false }), f.path);
   const head = await f.git.value('rev-parse', 'HEAD');
   assert.equal(await new Git(chosen).value('rev-parse', 'refs/heads/feature/local'), head);
@@ -893,7 +1019,7 @@ test('uploadLocal new first target pushes once and sets upstream only on success
   const target = path.join(f.base, 'first-target.git');
   await new Git(f.base).run(['init', '--bare', '--initial-branch=main', target]);
   f.transports.set('origin', target);
-  const ui = new ScriptedConsole(['1', '', '1', 'first-project', '1', 'y', 'a', 'first upload', 'y', 'y', '', 'y']);
+  const ui = new ScriptedConsole(['1', '1', 'first-project', '1', 'y', 'a', 'first upload', 'y', 'y', '', 'y']);
   assert.equal(await uploadLocal(ui, f.path, { selectDirectory: false }), f.path);
   assert.equal(f.pushes.length, 1);
   assert.deepEqual(f.pushes[0].args, ['push', '--no-follow-tags', '--', 'origin', `${await f.git.value('rev-parse', 'HEAD')}:refs/heads/main`]);
@@ -925,7 +1051,7 @@ test('push selecting a newly created remote never recursively pushes inside addR
   const target = path.join(f.base, 'push-target.git');
   await new Git(f.base).run(['init', '--bare', '--initial-branch=main', target]);
   f.transports.set('origin', target);
-  const ui = new ScriptedConsole(['1', '', '1', 'push-target', '1', 'y', '', 'y']);
+  const ui = new ScriptedConsole(['1', '1', 'push-target', '1', 'y', '', 'y']);
   await push(ui, f.git);
   assert.equal(f.api.creates.length, 1);
   assert.equal(f.pushes.length, 1);
@@ -943,8 +1069,8 @@ for (const address of ['git@github.com:other-owner/not-created.git', 'https://gi
     await writeFile(hook, `#!/bin/sh\ngit config remote.origin.url '${address}'\n`);
     await chmod(hook, 0o700);
     await f.git.run(['config', 'core.hooksPath', hooks]);
-    const ui = new ScriptedConsole(['1', '', '1', 'pinned-project', '1', 'y', 'a', 'saved locally'], { quick: true });
-    await assert.rejects(uploadLocal(ui, f.path, { selectDirectory: false }), /规范 SSH 地址.*拒绝继续上传/u);
+    const ui = new ScriptedConsole(['1', '1', 'pinned-project', '1', 'y', 'a', 'saved locally'], { quick: true });
+    await assert.rejects(uploadLocal(ui, f.path, { selectDirectory: false }), /规范(?: SSH)?地址.*拒绝继续上传/u);
     assert.equal(f.api.creates.length, 1);
     assert.equal(f.pushes.length, 0);
     assert.equal(await f.git.hasCommits(), true);
@@ -959,14 +1085,14 @@ test('created selection from push chooseRemote remains pinned through the final 
   const f = await managedCreation(t);
   await f.write();
   await f.commit();
-  const ui = new ScriptedConsole(['1', '', '1', 'direct-pinned', '1', 'y', '', 'y']);
+  const ui = new ScriptedConsole(['1', '1', 'direct-pinned', '1', 'y', '', 'y']);
   const confirm = ui.routineConfirm.bind(ui);
   ui.routineConfirm = async (prompt, ...args) => {
     const result = await confirm(prompt, ...args);
     if (prompt.includes('确认联网并上传')) await f.git.run(['remote', 'set-url', '--push', 'origin', 'git@github.com:other/private.git']);
     return result;
   };
-  await assert.rejects(push(ui, f.git), /规范 SSH 地址.*拒绝继续上传/u);
+  await assert.rejects(push(ui, f.git), /规范(?: SSH)?地址.*拒绝继续上传/u);
   assert.equal(f.api.creates.length, 1);
   assert.equal(f.pushes.length, 0);
   assert.equal(await f.git.config('branch.main.remote'), '');
@@ -978,14 +1104,14 @@ test('created selection refuses a same-repository HTTPS rewrite introduced durin
   const f = await managedCreation(t, { bound: true });
   await f.write();
   await f.commit();
-  const ui = new ScriptedConsole(['1', '', 'last-second-rewrite', '1', 'y', '', 'y']);
+  const ui = new ScriptedConsole(['1', 'last-second-rewrite', '1', 'y', '', 'y']);
   const confirm = ui.routineConfirm.bind(ui);
   ui.routineConfirm = async (prompt, ...args) => {
     const result = await confirm(prompt, ...args);
     if (prompt.includes('确认联网并上传')) await f.git.run(['config', 'url.https://github.com/.pushInsteadOf', 'git@github.com:']);
     return result;
   };
-  await assert.rejects(uploadLocal(ui, f.path, { selectDirectory: false }), /HTTPS.*不能改用外部 HTTPS 凭据/u);
+  await assert.rejects(uploadLocal(ui, f.path, { selectDirectory: false }), /不能换协议.*外部凭据|HTTPS.*不能改用外部 HTTPS 凭据/u);
   assert.equal(f.pushes.length, 0);
   assert.equal(f.api.creates.length, 1);
   assert.equal(await f.git.config('remote.origin.url'), 'git@github.com:fixture-login/last-second-rewrite.git');
@@ -996,7 +1122,7 @@ test('created selection refuses a project binding removed during final upload co
   const f = await managedCreation(t, { bound: true });
   await f.write();
   await f.commit();
-  const ui = new ScriptedConsole(['1', '', 'last-second-unbind', '1', 'y', '', 'y']);
+  const ui = new ScriptedConsole(['1', 'last-second-unbind', '1', 'y', '', 'y']);
   const confirm = ui.routineConfirm.bind(ui);
   ui.routineConfirm = async (prompt, ...args) => {
     const result = await confirm(prompt, ...args);
@@ -1015,7 +1141,7 @@ test('created selection refuses profile edits during final upload confirmation',
   const f = await managedCreation(t, { bound: true });
   await f.write();
   await f.commit();
-  const ui = new ScriptedConsole(['1', '', 'last-second-profile', '1', 'y', '', 'y']);
+  const ui = new ScriptedConsole(['1', 'last-second-profile', '1', 'y', '', 'y']);
   const confirm = ui.routineConfirm.bind(ui);
   ui.routineConfirm = async (prompt, ...args) => {
     const result = await confirm(prompt, ...args);
@@ -1059,12 +1185,13 @@ test('manually configured existing HTTPS target cannot change after its final di
 test('created repository rechecks remote-name collision after the server callback without overwriting', async (t) => {
   const f = await managedCreation(t);
   f.api.afterCreated = async () => { await f.git.run(['remote', 'add', 'origin', 'https://github.com/other/retained.git']); };
-  const ui = new ScriptedConsole(['1', '', '1', 'created-before-collision', '1', 'y']);
+  const ui = new ScriptedConsole(['1', '1', 'created-before-collision', '1', 'y']);
   await assert.rejects(addRemote(ui, f.git), /没有覆盖/u);
   assert.equal(f.api.creates.length, 1);
   assert.deepEqual(await f.git.remoteUrls('origin'), ['https://github.com/other/retained.git']);
   assert.match(ui.transcript, /GitHub 仓库已创建：https:\/\/github\.com\/fixture-login\/created-before-collision/u);
-  assert.match(ui.transcript, /本地远程尚未关联.*不自动删除或回滚/u);
+  assert.match(ui.transcript, /仓库创建：已完成/u);
+  assert.match(ui.transcript, /本地关联：未执行|本地关联：失败/u);
   assert.equal(f.pushes.length, 0);
   assert.deepEqual(ui.answers, []);
 });

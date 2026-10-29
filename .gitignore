@@ -18,6 +18,7 @@ dist/
 /artifacts/cli-smoke-*.txt
 /artifacts/login-security/
 /artifacts/local-trim/
+/artifacts/native-personal/
 
 # Isolated tests and local task state
 .claude-tmp/

@@ -8,7 +8,7 @@ import { GitError } from '../dist/git.js';
 import { fixture, ScriptedConsole } from './support.mjs';
 
 const enterprise = { mode: 'managed-ssh', host: { provider: 'github-enterprise', host: 'code.example.invalid', apiHost: 'code.example.invalid', webBase: 'https://code.example.invalid', sshHost: 'ssh.example.invalid', sshPort: 2222, sshUser: 'git-enterprise', sshAlias: 'work-alias' } };
-function fakeProfile(f) { return new Profile({ profile_id: 'a'.repeat(32), label: 'fake', name: 'Name', email: 'email', github_login: 'login', private_key: join(f.base, 'missing-key'), public_key: join(f.base, 'missing-key.pub') }); }
+function fakeProfile(f) { const profileId = 'a'.repeat(32), folder = join(new ProfileStore().profilesDir, profileId); return new Profile({ profile_id: profileId, label: 'fake', name: 'Name', email: 'email', github_login: 'login', private_key: join(folder, 'missing-key'), public_key: join(folder, 'missing-key.pub') }); }
 
 test('per-project host transport config preserves explicit Enterprise and generic provider boundary', async t => {
   const f = await fixture(t); const store = new HostStore(); assert.equal(await store.get(f.path), undefined); await store.set(f.path, enterprise); assert.deepEqual(await store.get(f.path), enterprise);
@@ -29,6 +29,13 @@ test('native SSH and HTTPS profile identity do not read managed keys or probe th
   const fakeSsh = join(f.base, 'fake ssh'); await fs.writeFile(fakeSsh, 'FAKE EXECUTABLE');
   const args = buildSshArgs(profile, undefined, () => fakeSsh, { ...enterprise, mode: 'native-ssh' }); assert.ok(args.includes('2222')); assert.ok(args.includes('git-enterprise')); assert.equal(args.includes('-F'), false); assert.equal(args.includes('-i'), false);
   let calls = 0; const result = await testProfile(new ScriptedConsole([]), f.path, profile, { transport: { mode: 'https', host: DEFAULT_HOST }, runProcess: async () => { calls++; throw new Error('must not execute'); } }); assert.equal(result, 'unverified'); assert.equal(calls, 0);
+});
+
+test('native and HTTPS identity contexts still reject SSH metadata with keys outside its managed profile directory', async t => {
+  const f = await fixture(t), profile = fakeProfile(f);
+  profile.private_key = join(f.base, 'outside-key'); profile.public_key = join(f.base, 'outside-key.pub');
+  for (const mode of ['native-ssh', 'https']) await assert.rejects(profileGit(f.path, profile, { mode, host: DEFAULT_HOST }), /密钥必须位于该账号的托管目录/u);
+  await assert.rejects(fs.stat(profile.private_key), { code: 'ENOENT' });
 });
 
 for (const quick of [true, false]) {

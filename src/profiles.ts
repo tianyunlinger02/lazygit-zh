@@ -10,6 +10,7 @@ import { Cancelled, type Console } from './ui.js';
 import { currentSession, requireSession } from './session.js';
 import { managedKeyMarker, parsePrivateKey } from './managed-keys.js';
 import { configureHttps } from './credentials.js';
+import type { CredentialPin } from './credential-pin.js';
 import {
   MISSING, checkedPath, exactKeys, isErrno, location, mkdirPrivate, readJson, record,
   setMode, text, withStoreLock, writeJson,
@@ -18,7 +19,20 @@ import { appDataDir } from './app-context.js';
 import { DEFAULT_TRANSPORT, HostStore, resolveTransport, transportGitConfig, validateTransport, type TransportTarget } from './hosts.js';
 
 export { appDataDir } from './app-context.js';
+// The bindings envelope stays schema 2; only explicit keyless profiles use schema 3.
 export const SCHEMA_VERSION = 2;
+export const HTTPS_PROFILE_SCHEMA_VERSION = 3;
+const PROFILE_STORE = Symbol('validated-profile-store');
+const profileStores = new WeakMap<object, string>();
+const storeCapabilities = new Map<string, object>();
+function markProfileStore(profile: Profile, directory: string): Profile {
+  const root = rootKey(directory);
+  let capability = storeCapabilities.get(root);
+  if (!capability) { capability = Object.freeze({}); storeCapabilities.set(root, capability); profileStores.set(capability, root); }
+  // Enumerable symbols survive runtime spreads, but never JSON serialization.
+  Object.defineProperty(profile, PROFILE_STORE, { value: capability, enumerable: true, configurable: true });
+  return profile;
+}
 export const IDENTITY_ENV = ['GIT_SSH_COMMAND', 'GIT_SSH', 'GIT_SSH_VARIANT', 'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'] as const;
 export const REJECT_ENV = [...IDENTITY_ENV, 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT'] as const;
 export const STATUS_LABELS = { unverified: '未验证', verified: '用户曾确认成功' } as const;
@@ -33,24 +47,62 @@ export type ProcessRunner = (program: string, args: string[], options?: Record<s
 export interface ProfileStoreOptions { runProcess?: ProcessRunner; which?: (program: string) => string | undefined; transport?: TransportTarget }
 
 export class Profile {
+  schema_version: 2 | 3;
   profile_id: string;
   label: string;
   name: string;
   email: string;
   github_login: string;
-  private_key: string;
-  public_key: string;
+  private_key: string | null;
+  public_key: string | null;
   ssh_program: string;
   status: 'unverified' | 'verified';
   remember_auth: boolean;
   constructor(values: {
-    profile_id: string; label: string; name: string; email: string; github_login: string;
-    private_key: string; public_key: string; ssh_program?: string; status?: 'unverified' | 'verified'; remember_auth?: boolean;
+    schema_version?: 2 | 3; profile_id: string; label: string; name: string; email: string; github_login: string;
+    private_key: string | null; public_key: string | null; ssh_program?: string; status?: 'unverified' | 'verified'; remember_auth?: boolean;
   }) {
+    this.schema_version = values.schema_version ?? 2;
     this.profile_id = values.profile_id; this.label = values.label; this.name = values.name; this.email = values.email;
     this.github_login = values.github_login; this.private_key = values.private_key; this.public_key = values.public_key;
     this.ssh_program = values.ssh_program ?? ''; this.status = values.status ?? 'unverified'; this.remember_auth = values.remember_auth ?? false;
+    const capability = (values as unknown as { [PROFILE_STORE]?: object })[PROFILE_STORE];
+    if (capability && profileStores.has(capability)) Object.defineProperty(this, PROFILE_STORE, { value: capability, enumerable: true, configurable: true });
   }
+}
+export type SshProfile = Profile & { schema_version: 2; private_key: string; public_key: string };
+export type HttpsOnlyProfile = Profile & { schema_version: 3; private_key: null; public_key: null };
+export function isHttpsOnlyProfile(profile: Profile): profile is HttpsOnlyProfile {
+  return profile.schema_version === HTTPS_PROFILE_SCHEMA_VERSION && profile.private_key === null && profile.public_key === null
+    && profile.ssh_program === '' && profile.status === 'unverified' && profile.remember_auth === false;
+}
+export function isSshProfile(profile: Profile): profile is SshProfile {
+  return profile.schema_version === 2 && typeof profile.private_key === 'string' && typeof profile.public_key === 'string';
+}
+function requireSshProfile(profile: Profile): asserts profile is SshProfile {
+  if (isHttpsOnlyProfile(profile)) throw new GitError('此 HTTPS-only 账号没有 SSH 密钥；请明确选择 HTTPS 传输，或另建 SSH 账号。');
+  if (profile.schema_version !== 2 || typeof profile.private_key !== 'string' || typeof profile.public_key !== 'string') throw new GitError('SSH 账号密钥元数据无效，不会回退外部身份。');
+}
+/** A validated runtime capability survives object spreads, but no persisted root is trusted. */
+export function profileStoreDirectory(profileValue: Profile): string {
+  const profile = asProfile(profileValue);
+  const capability = (profile as unknown as { [PROFILE_STORE]?: object })[PROFILE_STORE];
+  const known = capability && profileStores.get(capability);
+  if (isHttpsOnlyProfile(profile)) {
+    if (known) return known;
+    throw new GitError('HTTPS-only 账号的资料目录归属未经验证，请从凭据库重新加载账号。');
+  }
+  requireSshProfile(profile);
+  // Compatibility for callers constructing legacy SSH profiles explicitly.
+  const directory = known || path.dirname(path.dirname(path.dirname(location(profile.private_key))));
+  if (rootKey(path.dirname(location(profile.private_key))) !== rootKey(path.join(directory, 'profiles', id(profile.profile_id)))
+    || rootKey(path.dirname(location(profile.public_key))) !== rootKey(path.join(directory, 'profiles', profile.profile_id))) throw new GitError('密钥必须位于该账号的托管目录。');
+  return directory;
+}
+function checkProfileSession(profile: Profile, directory = profileStoreDirectory(profile)): void {
+  const session = currentSession();
+  if (session && rootKey(session.vault.directory) !== rootKey(directory)) throw new GitError('此账号不属于当前解锁的凭据库。');
+  if (isHttpsOnlyProfile(profile)) requireSession();
 }
 
 function isWindowsPath(value: string): boolean { return /^[A-Za-z]:[\\/]/u.test(value) || value.startsWith('\\\\'); }
@@ -71,18 +123,21 @@ function asProfile(value: Profile | Record<string, unknown>): Profile {
 }
 function quoteShell(value: string): string { return `'${value.replaceAll("'", "'\\''")}'`; }
 function normalizePath(value: string): string { return process.platform === 'win32' ? value.replaceAll('\\', '/').toLowerCase() : value; }
-async function displayPublicKey(ui: Console, file: string): Promise<void> {
-  if (!file.endsWith('.pub')) { ui.text('只接受 .pub 公钥文件；不会打开私钥。'); return; }
+async function displayPublicKey(ui: Console, file: string | null): Promise<void> {
+  if (file === null) { ui.text('此 HTTPS-only 账号不含 SSH 私钥或公钥；使用 HTTPS / Token，无需上传公钥。'); return; }
+  if (!file.endsWith('.pub')) { ui.error('只接受 .pub 公钥文件；不会打开私钥。'); return; }
   checkedPath(file, 'file');
-  if ((await fsp.stat(file)).size > 65_536) { ui.text('文件过大，不作为 SSH 公钥读取。'); return; }
+  if ((await fsp.stat(file)).size > 65_536) { ui.error('文件过大，不作为 SSH 公钥读取。'); return; }
   const value = (await fsp.readFile(file, 'utf8')).trim();
-  if (CONTROL.test(value) || !/^(?:ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com) [A-Za-z0-9+/]+={0,2}(?: [^\r\n]*)?$/u.test(value)) { ui.text('文件不是支持的单行 OpenSSH 公钥，已停止，不显示其内容。'); return; }
+  if (CONTROL.test(value) || !/^(?:ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com) [A-Za-z0-9+/]+={0,2}(?: [^\r\n]*)?$/u.test(value)) { ui.error('文件不是支持的单行 OpenSSH 公钥，已停止，不显示其内容。'); return; }
   ui.text('下面是完整 SSH 公钥，不是私钥；可复制到 GitHub。绝不要分享没有 .pub 后缀的私钥。'); ui.text(value); ui.text('请手工访问 https://github.com/settings/keys，添加此公钥用于认证。'); ui.text('AutoGit 会为绑定项目自动选用这把密钥。');
 }
 
 function profileKeyArgs(profile: Profile, storeDirectory: string, whichFn: (program: string) => string | undefined, target: TransportTarget = DEFAULT_TRANSPORT): string[] {
   validateTransport(target);
   if (target.mode === 'https') throw new GitError('HTTPS 模式不使用 SSH 参数。');
+  requireSshProfile(profile);
+  checkProfileSession(profile, storeDirectory);
   if (target.mode === 'native-ssh') {
     const args = [programPath('ssh', '', whichFn)];
     if (target.host.sshPort !== undefined) args.push('-p', String(target.host.sshPort));
@@ -91,14 +146,14 @@ function profileKeyArgs(profile: Profile, storeDirectory: string, whichFn: (prog
   }
   const privateKey = checkedPath(currentSession() ? profile.public_key : profile.private_key, 'file');
   const expectedParent = path.join(storeDirectory, 'profiles', id(profile.profile_id));
-  if (path.dirname(privateKey) !== expectedParent) throw new GitError('私钥不在该账号的托管目录。');
+  if (rootKey(path.dirname(privateKey)) !== rootKey(expectedParent)) throw new GitError('私钥不在该账号的托管目录。');
   const known = checkedPath(path.join(storeDirectory, 'known_hosts'), 'file');
   const ssh = programPath('ssh', profile.ssh_program, whichFn);
   const values = [ssh, privateKey, known].map((value) => process.platform === 'win32' ? value.replaceAll('\\', '/') : value);
   const args = [values[0], '-F', 'none', '-i', values[1]];
   const session = currentSession();
   if (session) {
-    if (path.resolve(session.vault.directory) !== path.resolve(storeDirectory)) throw new GitError('此账号不属于当前解锁的凭据库。');
+    if (rootKey(session.vault.directory) !== rootKey(storeDirectory)) throw new GitError('此账号不属于当前解锁的凭据库。');
     const endpoint = session.agentEndpoint(profile.profile_id);
     if (!endpoint) throw new GitError('此账号的本次 SSH 会话尚未解锁。');
     args.push('-o', `IdentityAgent="${endpoint.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`);
@@ -125,7 +180,9 @@ function programPath(name: string, custom: string, whichFn: (program: string) =>
 
 export function buildSshArgs(profileValue: Profile, directory?: string, whichFn = which, target: TransportTarget = DEFAULT_TRANSPORT): string[] {
   const profile = asProfile(profileValue);
-  const storeDirectory = directory ?? path.dirname(path.dirname(path.dirname(profile.private_key)));
+  requireSshProfile(profile);
+  const storeDirectory = profileStoreDirectory(profile);
+  if (directory !== undefined && rootKey(directory) !== rootKey(storeDirectory)) throw new GitError('账号与资料目录不匹配。');
   return profileKeyArgs(profile, storeDirectory, whichFn, target);
 }
 export function build_ssh_command(profileValue: Profile, directory?: string, whichFn = which, target: TransportTarget = DEFAULT_TRANSPORT): string {
@@ -140,8 +197,10 @@ function checkEnvironment(): void {
 
 async function validateSsh(profileValue: Profile, directory: string, runner: ProcessRunner, whichFn: (program: string) => string | undefined, target: TransportTarget = DEFAULT_TRANSPORT): Promise<void> {
   validateTransport(target);
-  if (target.mode !== 'managed-ssh') return;
   const profile = asProfile(profileValue);
+  checkProfileSession(profile, directory);
+  if (target.mode !== 'https') requireSshProfile(profile);
+  if (target.mode !== 'managed-ssh') return;
   if (currentSession()) await requireSession().sshAgent(profile.profile_id);
   const args = buildSshArgs(profileValue, directory, whichFn, target);
   const result = await runner(args[0], args.slice(1).concat(['-G', `${target.host.sshUser ?? 'git'}@${target.host.sshHost}`]), { cwd: directory, interactive: false, check: false });
@@ -161,14 +220,13 @@ async function validateSsh(profileValue: Profile, directory: string, runner: Pro
   if (!okay) throw new GitError('SSH 不支持单密钥、独立 known_hosts 和严格主机校验的受控模式；请使用兼容 OpenSSH。');
 }
 
-export async function profileGit(directory: string, profileValue: Profile, transport?: TransportTarget, url?: string): Promise<Git> {
+export async function profileGit(directory: string, profileValue: Profile, transport?: TransportTarget, url?: string, pin?: CredentialPin): Promise<Git> {
   checkEnvironment();
   const profile = asProfile(profileValue);
-  const storeDirectory = path.dirname(path.dirname(path.dirname(profile.private_key)));
+  const storeDirectory = profileStoreDirectory(profile);
+  checkProfileSession(profile, storeDirectory);
   const session = currentSession();
-  if (session && rootKey(session.vault.directory) !== rootKey(storeDirectory)) throw new GitError('此账号不属于当前解锁的凭据库。');
   const target = transport ? validateTransport(transport) : (await new HostStore(storeDirectory).get(directory)) ?? DEFAULT_TRANSPORT;
-  if (session && target.mode === 'managed-ssh') await session.sshAgent(profile.profile_id);
   await validateSsh(profile, storeDirectory, runProcess as unknown as ProcessRunner, which, target);
   const config: Record<string, string> = {
     'user.name': safeText(profile.name), 'user.email': safeText(profile.email),
@@ -184,8 +242,10 @@ export async function profileGit(directory: string, profileValue: Profile, trans
   const env: Record<string, undefined> = {};
   for (const key of IDENTITY_ENV) env[key] = undefined;
   const git = new Git(directory, { config, env, rejectEnv: REJECT_ENV });
+  checkProfileSession(profile, storeDirectory);
+  if (session && currentSession() !== session) throw new GitError('凭据会话已变化，请重新选择账号。');
   if (!session || target.credentials === 'external') return git;
-  return target.mode === 'https' ? configureHttps(git, profile, { host: target.host, url }) : withoutExternalCredentials(git);
+  return target.mode === 'https' ? configureHttps(git, profile, { host: target.host, url, pin }) : withoutExternalCredentials(git);
 }
 
 export class ProfileStore {
@@ -209,6 +269,14 @@ export class ProfileStore {
     for (const field of ['label', 'name', 'email', 'github_login', 'status']) safeText(profile[field as keyof Profile]);
     if (profile.status !== 'unverified' && profile.status !== 'verified' || typeof profile.remember_auth !== 'boolean' || !LOGIN.test(profile.github_login)) throw new GitError('账号状态、记住认证标志或 GitHub 登录名无效。');
     const parent = path.join(this.profiles_dir, id(profile.profile_id));
+    const capability = (profile as unknown as { [PROFILE_STORE]?: object })[PROFILE_STORE];
+    const known = capability && profileStores.get(capability);
+    if (known && known !== rootKey(this.directory)) throw new GitError('账号与资料目录不匹配。');
+    if (profile.schema_version === HTTPS_PROFILE_SCHEMA_VERSION) {
+      if (!isHttpsOnlyProfile(profile)) throw new GitError('HTTPS-only 账号必须无私钥、公钥及 SSH 专属状态。');
+      return markProfileStore(profile, this.directory);
+    }
+    requireSshProfile(profile);
     for (const value of [profile.private_key, profile.public_key]) {
       const candidate = files ? checkedPath(value, 'file') : location(value);
       if (path.dirname(candidate) !== parent || path.basename(candidate) === 'profile.json') throw new GitError('密钥必须位于该账号的托管目录。');
@@ -220,23 +288,27 @@ export class ProfileStore {
       if (!(path.posix.isAbsolute(profile.ssh_program) || isWindowsPath(profile.ssh_program)) || /["%]/u.test(profile.ssh_program) || profile.ssh_program.split(/[\\/]/u).includes('..')) throw new GitError('自定义 SSH 程序必须是无双引号、百分号的绝对路径。');
       if (files) programPath('ssh', profile.ssh_program, this.which);
     }
-    return profile;
+    return markProfileStore(profile, this.directory);
   }
   encode_profile(profileValue: Profile): Record<string, unknown> {
     const profile = this.validate(asProfile(profileValue), false);
-    const data: Record<string, unknown> = { schema_version: SCHEMA_VERSION };
+    const data: Record<string, unknown> = { schema_version: profile.schema_version };
     for (const key of PROFILE_KEYS) data[key] = profile[key];
-    for (const key of ['private_key', 'public_key'] as const) data[key] = path.relative(this.directory, profile[key]).split(path.sep).join('/');
+    if (!isHttpsOnlyProfile(profile)) {
+      requireSshProfile(profile);
+      for (const key of ['private_key', 'public_key'] as const) data[key] = path.relative(this.directory, profile[key]).split(path.sep).join('/');
+    }
     return data;
   }
   encodeProfile(profile: Profile): Record<string, unknown> { return this.encode_profile(profile); }
   decode_profile(data: unknown, profileId?: string, files = true): Profile {
     if (record(data) && data.schema_version === 1) throw new GitError('旧版 schema 1 包含绝对路径，请先备份并手工迁移到便携 schema 2；不会自动扫描 HOME 或覆盖旧数据。');
-    if (!record(data) || data.schema_version !== SCHEMA_VERSION || !exactKeys(data, ['schema_version', ...PROFILE_KEYS])) throw new GitError('元数据结构或版本号无效。');
+    if (!record(data) || ![SCHEMA_VERSION, HTTPS_PROFILE_SCHEMA_VERSION].includes(Number(data.schema_version)) || typeof data.schema_version !== 'number' || !exactKeys(data, ['schema_version', ...PROFILE_KEYS])) throw new GitError('元数据结构或版本号无效。');
     if (typeof data.ssh_program !== 'string' || typeof data.remember_auth !== 'boolean' || (data.status !== 'unverified' && data.status !== 'verified')) throw new GitError('账号状态、记住认证标志或 SSH 程序无效。');
-    const values = { ...data } as Record<string, unknown>; delete values.schema_version;
-    const profile = new Profile(values as unknown as ConstructorParameters<typeof Profile>[0]);
+    const profile = new Profile(data as unknown as ConstructorParameters<typeof Profile>[0]);
     if (id(profile.profile_id) !== id(profileId ?? profile.profile_id)) throw new GitError('账号标识不匹配。');
+    if (profile.schema_version === HTTPS_PROFILE_SCHEMA_VERSION) return this.validate(profile, files);
+    requireSshProfile(profile);
     for (const key of ['private_key', 'public_key'] as const) {
       const value = safeText(profile[key]);
       const parts = value.split('/');
@@ -346,6 +418,26 @@ export class ProfileStore {
       return profile;
     });
   }
+  async createHttps(ui: Console, label: string, name: string, email: string, githubLogin: string): Promise<Profile | undefined> {
+    for (const value of [label, name, email, githubLogin]) safeText(value);
+    const session = requireSession();
+    if (rootKey(session.vault.directory) !== rootKey(this.directory) || !LOGIN.test(githubLogin)) throw new GitError('账号身份或解锁的资料目录不匹配。');
+    ui.text('HTTPS-only 只保存账号身份和提交署名；不生成或导入 SSH 密钥，不创建 known_hosts。选定账号后可使用加密 Token。');
+    if (!await ui.routineConfirm('确认保存 HTTPS-only 账号资料（无需 SSH 密钥）？')) return undefined;
+    return withStoreLock(this.directory, async () => {
+      if (requireSession() !== session) throw new GitError('凭据会话已变化，请重新选择账号。');
+      const compare = process.platform === 'win32' ? label.toLowerCase() : label;
+      if ((await this.list()).some((profile) => (process.platform === 'win32' ? profile.label.toLowerCase() : profile.label) === compare)) throw new GitError('账号标签重复。');
+      const profileId = crypto.randomBytes(16).toString('hex');
+      const profile = this.validate(new Profile({ schema_version: HTTPS_PROFILE_SCHEMA_VERSION, profile_id: profileId, label, name, email,
+        github_login: githubLogin, private_key: null, public_key: null, ssh_program: '', status: 'unverified', remember_auth: false }), false);
+      await mkdirPrivate(this.profiles_dir);
+      const folder = path.join(this.profiles_dir, profileId); await fsp.mkdir(folder, { mode: 0o700 }); await setMode(folder, 0o700);
+      if (requireSession() !== session) throw new GitError('凭据会话已变化，请重新选择账号。');
+      await writeJson(path.join(folder, 'profile.json'), this.encode_profile(profile));
+      return profile;
+    });
+  }
   private async createEncrypted(ui: Console, label: string, name: string, email: string, githubLogin: string, source?: string): Promise<Profile | undefined> {
     const session = requireSession();
     if (path.resolve(session.vault.directory) !== path.resolve(this.directory) || !LOGIN.test(githubLogin)) throw new GitError('账号身份或解锁的资料目录不匹配。');
@@ -386,7 +478,11 @@ export class ProfileStore {
   async validateMetadata(): Promise<void> {
     const profiles = await this.list();
     await this.bindings();
-    for (const profile of profiles) { checkedPath(profile.private_key, 'file'); checkedPath(profile.public_key, 'file'); }
+    for (const profile of profiles) {
+      if (isHttpsOnlyProfile(profile)) continue;
+      requireSshProfile(profile);
+      checkedPath(profile.private_key, 'file'); checkedPath(profile.public_key, 'file');
+    }
   }
   async remapBinding(oldDirectory: string, nextDirectory: string): Promise<void> {
     const oldRoot = rootKey(oldDirectory); const nextRoot = rootKey(await new Git(nextDirectory).root());
@@ -401,8 +497,12 @@ export class ProfileStore {
   async resolve_binding(directory: string): Promise<Profile | undefined> {
     let root: string; try { root = rootKey((await new Git(directory).root()) as unknown as string); } catch (error) { if (error instanceof GitError) return undefined; throw error; }
     const bindings = await this.bindings(); const item = bindings[root]; if (!item) return undefined;
-    const target = await new HostStore(this.directory).get(directory);
-    const profile = await this.load(item.profile_id, !target || target.mode === 'managed-ssh'); if (!isDeepStrictEqual(this.snapshot(profile), item.snapshot)) throw new GitError('当前绑定快照已过期，请明确重新绑定账号。'); return profile;
+    const target = (await new HostStore(this.directory).get(directory)) ?? DEFAULT_TRANSPORT;
+    const profile = await this.load(item.profile_id, target.mode === 'managed-ssh');
+    if (!isDeepStrictEqual(this.snapshot(profile), item.snapshot)) throw new GitError('当前绑定快照已过期，请明确重新绑定账号。');
+    checkProfileSession(profile, this.directory);
+    if (target.mode !== 'https') requireSshProfile(profile);
+    return profile;
   }
   async resolveBinding(directory: string): Promise<Profile | undefined> { return this.resolve_binding(directory); }
   async edit(ui: Console, profileId: string): Promise<Profile | undefined> {
@@ -430,6 +530,8 @@ export class ProfileStore {
     });
   }
   async change_auth(ui: Console, profileId: string, remember: boolean): Promise<Profile | undefined> {
+    const identity = await this.load(profileId, false);
+    if (isHttpsOnlyProfile(identity)) { ui.text('此 HTTPS-only 账号没有 SSH 私钥或口令；Token 由加密凭据库管理。'); return identity; }
     if (currentSession()) {
       const profile = await this.load(profileId);
       ui.text('此账号由加密凭据库统一管理；每次启动输入 AutoGit 解锁密码，不再通过移除私钥口令记住认证。');
@@ -438,7 +540,7 @@ export class ProfileStore {
     if (typeof remember !== 'boolean') throw new GitError('记住认证标志无效。');
     if (!remember && this.runProcess === (runProcess as unknown as ProcessRunner) && !process.stdin.isTTY) throw new GitError('设置新私钥口令需要原生交互终端；请在真实终端运行，不要通过管道输入口令。');
     return withStoreLock(this.directory, async () => {
-      const profile = await this.load(profileId); ui.text(remember ? '将移除托管副本的口令，持有 data 文件夹即可使用密钥。' : '由原生工具设置新口令；仍可输入空口令，取消记住不代表已加密。');
+      const profile = await this.load(profileId); requireSshProfile(profile); ui.text(remember ? '将移除托管副本的口令，持有 data 文件夹即可使用密钥。' : '由原生工具设置新口令；仍可输入空口令，取消记住不代表已加密。');
       if (!(await ui.routineConfirm('确认更改托管私钥的口令设置？'))) return undefined;
       const keygen = programPath('ssh-keygen', '', this.which);
       if (this.runProcess === (runProcess as unknown as ProcessRunner) && !process.stdin.isTTY) {
@@ -455,13 +557,17 @@ export class ProfileStore {
     let removeSecret = false;
     const removed = await withStoreLock(this.directory, async () => {
       const profile = await this.load(profileId, false); const bindings = await this.bindings(); const roots = Object.entries(bindings).filter(([, item]) => item.profile_id === profileId).map(([root]) => root);
-      const action = await ui.menu('删除账号范围', ['仅删除账号资料 / 解绑项目（保留托管密钥）', '删除账号资料和托管私钥、公钥 / 解绑项目']); if (!action) return false;
-      const deleteKeys = action === 2;
-      ui.text(`以下项目将解除绑定：\n${roots.join('\n') || '（无）'}\n${deleteKeys ? '将永久删除托管私钥与公钥。' : '保留托管密钥，不删除磁盘密钥文件。'}外部原件永不删除。`);
+      const keyless = isHttpsOnlyProfile(profile);
+      const action = keyless ? 1 : await ui.menu('删除账号范围', ['仅删除账号资料 / 解绑项目（保留托管密钥）', '删除账号资料和托管私钥、公钥 / 解绑项目']); if (!action) return false;
+      const deleteKeys = !keyless && action === 2;
+      ui.text(`以下项目将解除绑定：\n${roots.join('\n') || '（无）'}\n${keyless ? '此 HTTPS-only 账号没有 SSH 密钥；不会删除同主机/账号共享的 Token。' : deleteKeys ? '将永久删除托管私钥与公钥。' : '保留托管密钥，不删除磁盘密钥文件。'}外部原件永不删除。`);
       if (!(await ui.confirm(`最终确认：删除 ${profile.label} 的${deleteKeys ? '资料及托管密钥' : '资料'}并解除以上绑定？`))) return false;
       await this.saveBindings(Object.fromEntries(Object.entries(bindings).filter(([root]) => !roots.includes(root))));
       removeSecret = deleteKeys;
-      if (deleteKeys) for (const key of [profile.private_key, profile.public_key]) { checkedPath(key, 'file', { missing: true }); await fsp.unlink(key).catch((error: unknown) => { if (!isErrno(error, 'ENOENT')) throw error; }); }
+      if (deleteKeys) {
+        requireSshProfile(profile);
+        for (const key of [profile.private_key, profile.public_key]) { checkedPath(key, 'file', { missing: true }); await fsp.unlink(key).catch((error: unknown) => { if (!isErrno(error, 'ENOENT')) throw error; }); }
+      }
       await fsp.unlink(path.join(this.profiles_dir, profileId, 'profile.json')); return true;
     });
     if (removed && removeSecret && currentSession()) await requireSession().removeSsh(profileId);
@@ -469,12 +575,26 @@ export class ProfileStore {
   }
 }
 
-export async function chooseProfile(ui: Console): Promise<Profile | undefined> {
-  const profiles = await new ProfileStore().list(); if (!profiles.length) { ui.text('尚无账号，请先进入账号管理新建或导入密钥，再选择项目绑定。'); return undefined; }
-  const choice = await ui.menu('选择项目账号', profiles.map((profile) => `${profile.label} / ${profile.github_login}`)); return choice ? profiles[choice - 1] : undefined;
+export async function createHttpsAccount(ui: Console, store = new ProfileStore()): Promise<Profile | undefined> {
+  const values = [await ui.ask('标签'), await ui.ask('提交姓名'), await ui.ask('提交邮箱'), await ui.ask('GitHub 登录名')];
+  return store.createHttps(ui, values[0], values[1], values[2], values[3]);
 }
-export async function bindProject(directory: string, profileValue: Profile): Promise<Profile> {
-  const profile = asProfile(profileValue); const store = new ProfileStore(); const loaded = await store.load(profile.profile_id); if (!isDeepStrictEqual(store.snapshot(loaded), store.snapshot(profile))) throw new GitError('账号已变化，请重新选择。'); return store.bind(directory, profile.profile_id);
+export async function chooseProfile(ui: Console, options: { createHttps?: boolean } = {}): Promise<Profile | undefined> {
+  const store = new ProfileStore(); const profiles = await store.list();
+  if (!profiles.length && !options.createHttps) { ui.warn('尚无账号，请先进入账号管理新建 HTTPS-only 账号或导入 SSH 密钥，再选择项目绑定。'); return undefined; }
+  const entries = profiles.map((profile) => `${profile.label} / ${profile.github_login}${isHttpsOnlyProfile(profile) ? ' / HTTPS-only' : ''}`);
+  if (options.createHttps) entries.push('新建 HTTPS-only 账号（无需 SSH 密钥）');
+  const choice = await ui.menu('选择项目账号', entries);
+  if (!choice) return undefined;
+  return choice > profiles.length ? createHttpsAccount(ui, store) : profiles[choice - 1];
+}
+export async function bindProject(directory: string, profileValue: Profile, transport?: TransportTarget): Promise<Profile> {
+  const profile = asProfile(profileValue); const store = new ProfileStore();
+  if (rootKey(profileStoreDirectory(profile)) !== rootKey(store.directory)) throw new GitError('账号与资料目录不匹配。');
+  const target = transport ? validateTransport(transport) : (await new HostStore(store.directory).get(directory)) ?? DEFAULT_TRANSPORT;
+  const loaded = await store.load(profile.profile_id, target.mode === 'managed-ssh');
+  if (!isDeepStrictEqual(store.snapshot(loaded), store.snapshot(profile))) throw new GitError('账号已变化，请重新选择。');
+  return store.bind(directory, profile.profile_id, target);
 }
 export async function resolveBinding(directory: string, store = new ProfileStore()): Promise<Profile | undefined> { return store.resolve_binding(directory); }
 function withoutExternalCredentials(git: Git): Git {
@@ -489,10 +609,12 @@ export async function boundGit(directory: string): Promise<Git> {
   return currentSession() && target?.credentials !== 'external' ? withoutExternalCredentials(git) : git;
 }
 export async function testProfile(ui: Console, directory: string, profileValue: Profile, options: ProfileStoreOptions = {}): Promise<'verified' | 'unverified'> {
-  checkEnvironment(); const profile = asProfile(profileValue); const storeDirectory = path.dirname(path.dirname(path.dirname(profile.private_key))); const runner = options.runProcess ?? (runProcess as unknown as ProcessRunner);
+  checkEnvironment(); const profile = asProfile(profileValue); const storeDirectory = profileStoreDirectory(profile); const runner = options.runProcess ?? (runProcess as unknown as ProcessRunner);
+  checkProfileSession(profile, storeDirectory);
   const target = options.transport ?? (await new HostStore(storeDirectory).get(directory)) ?? DEFAULT_TRANSPORT;
   validateTransport(target);
-  if (target.mode === 'https') { ui.text('HTTPS 模式请通过仓库获取/推送验证外部凭据；不执行 SSH 测试。'); return 'unverified'; }
+  if (target.mode === 'https') { ui.text('HTTPS 模式请通过 Token 账号核验或仓库获取/推送验证相应能力；不执行 SSH 测试。'); return 'unverified'; }
+  requireSshProfile(profile);
   if (currentSession() && target.mode === 'managed-ssh') await requireSession().sshAgent(profile.profile_id);
   const args = buildSshArgs(profile, storeDirectory, options.which ?? which, target);
   const endpoint = target.mode === 'native-ssh' ? target.host.sshAlias ?? target.host.sshHost : target.host.sshHost;
@@ -510,13 +632,20 @@ export const test_profile = testProfile;
 export async function profilesMenu(ui: Console, directory: string): Promise<void> {
   const store = new ProfileStore(); ui.text('托管 SSH 使用独立密钥与 known_hosts；需要已有 SSH config / 代理 / 跳板时，在“主机与传输”明确选择原生 SSH 模式。');
   while (true) {
-    const choice = await ui.menu('AutoGit 账号管理', ['新建账号 / 生成密钥', '导入已有私钥', '列出 / 查看账号', '绑定当前项目', '解绑当前项目', '测试当前绑定', '删除账号', '编辑账号署名 / 标签 / 预期登录名', '记住认证 / 更改私钥口令', '文件夹保管 / 泄露撤销帮助']); if (!choice) return;
+    const choice = await ui.menu('AutoGit 账号管理', ['新建账号（HTTPS-only / SSH）', '导入已有私钥', '列出 / 查看账号', '绑定当前项目', '解绑当前项目', '测试当前绑定', '删除账号', '编辑账号署名 / 标签 / 预期登录名', '记住认证 / 更改私钥口令', '文件夹保管 / 泄露撤销帮助']); if (!choice) return;
     try {
       if (choice === 1 || choice === 2) {
-        const remember = currentSession() ? true : await ui.confirm('记住认证（推荐）？使用无口令私钥，需保管好软件文件夹；不记住则由原生工具处理口令。', true);
-        const values = [await ui.ask('标签'), await ui.ask('提交姓名'), await ui.ask('提交邮箱'), await ui.ask('GitHub 登录名')];
-        const source = choice === 2 ? await ui.ask('已有私钥的绝对路径') : undefined; const profile = await store.create(ui, values[0], values[1], values[2], values[3], { source, remember_auth: remember });
-        if (profile) { ui.text(`已保存账号 ${profile.label}。`); await displayPublicKey(ui, profile.public_key); }
+        const kind = choice === 1 ? await ui.menu('新建账号类型', ['HTTPS / Token-only（推荐，无需 SSH 密钥）', '托管 SSH / 生成密钥']) : 2;
+        if (!kind) continue;
+        let profile: Profile | undefined;
+        if (kind === 1) profile = await createHttpsAccount(ui, store);
+        else {
+          const remember = currentSession() ? true : await ui.confirm('记住认证（推荐）？使用无口令私钥，需保管好软件文件夹；不记住则由原生工具处理口令。', true);
+          const values = [await ui.ask('标签'), await ui.ask('提交姓名'), await ui.ask('提交邮箱'), await ui.ask('GitHub 登录名')];
+          const source = choice === 2 ? await ui.ask('已有私钥的绝对路径') : undefined;
+          profile = await store.create(ui, values[0], values[1], values[2], values[3], { source, remember_auth: remember });
+        }
+        if (profile) { ui.success(`已保存账号 ${profile.label}。`); await displayPublicKey(ui, profile.public_key); }
       } else if (choice === 5) {
         if (await ui.routineConfirm('解除当前项目的 AutoGit 绑定？')) await store.unbind(directory);
       } else if (choice === 6) {
@@ -526,15 +655,24 @@ export async function profilesMenu(ui: Console, directory: string): Promise<void
       } else {
         const profiles = await store.list(); if (!profiles.length) { ui.text('尚无账号。'); continue; }
         const selected = await ui.menu('选择账号', profiles.map((profile) => `${profile.label} / ${profile.github_login}`)); if (!selected) continue; const profile = profiles[selected - 1];
-        if (choice === 3) { for (const key of PROFILE_KEYS) ui.text(`${key}：${key === 'status' ? STATUS_LABELS[profile.status] : key === 'remember_auth' ? (profile.remember_auth ? '是' : '否') : profile[key] || '当前系统 SSH'}`); await displayPublicKey(ui, profile.public_key); }
+        if (choice === 3) {
+          ui.text(`账号类型：${isHttpsOnlyProfile(profile) ? 'HTTPS-only（无 SSH 密钥）' : 'SSH'}`);
+          for (const key of PROFILE_KEYS) ui.text(`${key}：${key === 'status' ? STATUS_LABELS[profile.status] : key === 'remember_auth' ? (profile.remember_auth ? '是' : '否') : profile[key] === null ? '无（HTTPS-only）' : key === 'ssh_program' && isHttpsOnlyProfile(profile) ? '不使用 SSH' : profile[key] || '当前系统 SSH'}`);
+          await displayPublicKey(ui, profile.public_key);
+        }
         else if (choice === 4 && await ui.routineConfirm(`将当前项目绑定到 ${profile.label}？`)) await store.bind(directory, profile.profile_id);
         else if (choice === 7) await store.delete(ui, profile.profile_id);
         else if (choice === 8) await store.edit(ui, profile.profile_id);
         else if (choice === 9) {
-          if (currentSession()) ui.text('此账号的托管私钥已纳入加密库，每次启动通过独立 AutoGit 密码解锁；无需移除私钥口令。可在“使用设置”修改解锁密码，忘记密码则使用离线恢复码。');
+          if (isHttpsOnlyProfile(profile)) ui.text('此 HTTPS-only 账号没有 SSH 私钥或口令；Token 由加密凭据库管理。');
+          else if (currentSession()) ui.text('此账号的托管私钥已纳入加密库，每次启动通过独立 AutoGit 密码解锁；无需移除私钥口令。可在“使用设置”修改解锁密码，忘记密码则使用离线恢复码。');
           else { const auth = await ui.menu('更改私钥口令', ['记住认证（移除托管副本口令）', '取消记住 / 原生设置新口令（可能仍为空）']); if (auth) await store.change_auth(ui, profile.profile_id, auth === 1); }
         }
       }
-    } catch (error) { if (error instanceof Cancelled) ui.text('已返回，尚未确认的操作不会执行。'); else if (error instanceof Error && (error instanceof GitError || 'code' in error)) ui.text(`账号操作未完成：${error.message}`); else throw error; }
+    } catch (error) {
+      if (error instanceof Cancelled) { if (error.warning) ui.warn(error.message); else ui.text('已返回，尚未确认的操作不会执行。'); }
+      else if (error instanceof Error && (error instanceof GitError || 'code' in error)) ui.error(`账号操作未完成：${error.message}`);
+      else throw error;
+    }
   }
 }

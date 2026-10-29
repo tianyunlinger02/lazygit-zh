@@ -131,6 +131,11 @@ function checkedRepository(result: ProcessResult, owner: string, name: string, v
   let data: unknown;
   try { data = parseStrictJson(outputText(result, 65_536)); }
   catch { throw new GitError('GitHub 仓库验证响应不是支持的严格 JSON。'); }
+  return checkedRepositoryData(data, owner, name, visibility, host);
+}
+
+/** Pure validator shared by the CLI projection and the native personal API. */
+export function checkedRepositoryData(data: unknown, owner: string, name: string, visibility: Visibility, host = 'github.com'): CreatedRepository {
   if (!record(data) || !exactKeys(data, REPOSITORY_FIELDS) || !record(data.owner) || !exactKeys(data.owner, ['login']) ||
       typeof data.owner.login !== 'string' || typeof data.name !== 'string' || typeof data.full_name !== 'string' || typeof data.private !== 'boolean') {
     throw new GitError('GitHub 仓库验证字段无效。');
@@ -275,7 +280,7 @@ export class GithubClient {
     try { result = await this.runner(program, args, { cwd: this.cwd, env, check: false, interactive: false, ...(body === undefined ? {} : { inputData: Buffer.isBuffer(body) ? body : Buffer.from(JSON.stringify(body)) }) }); }
     catch (error) {
       const message = `GitHub 请求未完成${launchDetail(error)}${writing ? '；写入结果未知，请先只读检查目标，不会自动重试或回滚' : ''}。原始错误已隐藏。`;
-      if (error instanceof Cancelled) throw new Cancelled(message);
+      if (error instanceof Cancelled) throw new Cancelled(message, writing);
       throw new GitError(message);
     } finally { this.clearToken(env); }
     if (result.status !== 0 || result.signal) throw readFailure(result, writing);
@@ -311,7 +316,7 @@ export class GithubClient {
     try { result = await this.runner(program, ['ssh-key', 'add', '-', '--title', title, '--type', 'authentication'], { cwd: this.cwd, env, check: false, interactive: false, inputData: Buffer.from(`${publicKey}\n`) }); }
     catch (error) {
       const message = 'SSH 公钥添加结果未知；请先到选定 host 的账号 SSH keys 页面检查，不会自动重试或删除。原始错误已隐藏。';
-      if (error instanceof Cancelled) throw new Cancelled(message);
+      if (error instanceof Cancelled) throw new Cancelled(message, true);
       throw new GitError(message);
     } finally { this.clearToken(env); }
     if (result.status !== 0 || result.signal) throw readFailure(result, true);
@@ -327,7 +332,7 @@ export class GithubClient {
     try { result = await this.runner(program, ['release', 'upload', tag, '--repo', `${this.host}/${loginName(context.owner)}/${validateRepositoryName(context.name)}`, ...(options.clobber ? ['--clobber'] : []), '--', ...files], { cwd: this.cwd, env, interactive: false, check: false }); }
     catch (error) {
       const message = '发布附件上传结果未知；部分附件可能已上传，请先只读检查，不会自动重试、覆盖或回滚。';
-      if (error instanceof Cancelled) throw new Cancelled(message);
+      if (error instanceof Cancelled) throw new Cancelled(message, true);
       throw new GitError(message);
     } finally { this.clearToken(env); }
     if (result.status !== 0 || result.signal) throw readFailure(result, true);
@@ -352,7 +357,7 @@ export class GithubClient {
     ui.text('gh 使用自己的外部网络传输与凭据存储，与 AutoGit 托管的 SSH 密钥分开；可能改变外部 gh/Git 配置与默认账号，不会自动恢复。');
     ui.text('登录由原生 gh 与浏览器处理；安全凭据存储不可用时，gh 可能回退到明文存储令牌。AutoGit 不接收、读取或保存令牌，也不会上传 SSH 密钥。');
     if (this.runner === runProcess && (!process.stdin.isTTY || !process.stdout.isTTY)) {
-      ui.text('gh 浏览器登录需要真实交互终端；请不要通过管道提供凭据。未启动登录。');
+      ui.warn('gh 浏览器登录需要真实交互终端；请不要通过管道提供凭据。未启动登录。');
       return false;
     }
     const { program, env } = await this.prepare(true);
@@ -360,8 +365,8 @@ export class GithubClient {
     try {
       result = await this.runner(program, ['auth', 'login', '--hostname', this.host, '--git-protocol', 'ssh', '--skip-ssh-key', '--web'], { cwd: this.cwd, env, interactive: true, check: false });
     } catch (error) {
-      if (error instanceof Cancelled) throw new Cancelled('外部 gh 登录已中断；外部凭据或默认账号可能已改变，不会自动恢复。');
-      ui.text(`gh 浏览器登录未完成${launchDetail(error)}；外部状态可能已改变，原始错误已隐藏。`);
+      if (error instanceof Cancelled) throw new Cancelled('外部 gh 登录已中断；外部凭据或默认账号可能已改变，不会自动恢复。', true);
+      ui.warn(`gh 浏览器登录未完成${launchDetail(error)}；外部状态可能已改变，原始错误已隐藏。`);
       return false;
     } finally { this.clearToken(env); }
     ui.text(`外部 gh 登录流程结束（${statusDetail(result)}）；不会据此认定账号匹配，仍需重新联网核对登录名。`);
@@ -386,7 +391,7 @@ export class GithubClient {
       result = await this.runner(program, createArgs, { cwd: this.cwd, env, interactive: false, check: false });
     } catch (error) {
       const message = `GitHub 创建结果未知，仓库可能已创建${error instanceof Cancelled ? '（操作已中断）' : launchDetail(error)}。${recovery(url)}`;
-      if (error instanceof Cancelled) throw new Cancelled(message);
+      if (error instanceof Cancelled) throw new Cancelled(message, true);
       throw new GitError(message);
     } finally { this.clearToken(env); }
     if (result.status !== 0) throw new GitError(creationFailure(result, url));
@@ -394,7 +399,7 @@ export class GithubClient {
     // irreversible creation state even if the next API call is interrupted.
     try { onCreated?.(url); }
     catch (error) {
-      if (error instanceof Cancelled) throw new Cancelled(knownCreated(url));
+      if (error instanceof Cancelled) throw new Cancelled(knownCreated(url), true);
       throw new GitError(knownCreated(url));
     }
     try {
@@ -402,7 +407,7 @@ export class GithubClient {
       if (verification.status !== 0) throw new GitError(`仓库验证未完成（${statusDetail(verification)}）。`);
       return checkedRepository(verification, expected, repository, visibility, host);
     } catch (error) {
-      if (error instanceof Cancelled) throw new Cancelled(knownCreated(url));
+      if (error instanceof Cancelled) throw new Cancelled(knownCreated(url), true);
       throw new GitError(knownCreated(url));
     }
   }
@@ -422,8 +427,8 @@ export async function authenticateGithub(ui: Console, client: GithubClient, expe
       try {
         const actual = await client.currentLogin();
         if (sameName(actual, selected)) return actual;
-        ui.text('Token 对应的 actor 与选定账号不一致；未改变账号或绑定。');
-      } catch (error) { if (error instanceof Cancelled) throw error; ui.text('托管 Token 的只读账号核验未通过；可能令牌过期、host 不匹配或网络不可用。不会读取外部 gh 凭据。'); }
+        ui.error('Token 对应的 actor 与选定账号不一致；未改变账号或绑定。');
+      } catch (error) { if (error instanceof Cancelled) throw error; ui.error('托管 Token 的只读账号核验未通过；可能令牌过期、host 不匹配或网络不可用。不会读取外部 gh 凭据。'); }
       if (!await ui.menu('托管 GitHub 凭据', ['重新录入选定 host / actor 的 Token'])) return undefined;
       await enrollToken(ui, client.host, selected);
     }
@@ -436,10 +441,10 @@ export async function authenticateGithub(ui: Console, client: GithubClient, expe
       try {
         const current = await client.currentLogin();
         if (sameName(current, selected)) return current;
-        ui.text(`当前 gh 账号 ${current} 与选定的 ${selected} 不一致；不会使用错误账号继续，也不会静默重新绑定。`);
+        ui.error(`当前 gh 账号 ${current} 与选定的 ${selected} 不一致；不会使用错误账号继续，也不会静默重新绑定。`);
       } catch (error) {
         if (error instanceof Cancelled) throw error;
-        ui.text('无法确认当前 gh 账号：可能未登录、认证已过期或网络失败。没有读取令牌或显示原始输出。');
+        ui.error('无法确认当前 gh 账号：可能未登录、认证已过期或网络失败。没有读取令牌或显示原始输出。');
       }
     }
     const choice = await ui.menu('明确选择 GitHub 认证方式', [`切换外部 gh 到预期账号 ${selected}`, '启动外部 gh 浏览器登录']);
@@ -449,7 +454,7 @@ export async function authenticateGithub(ui: Console, client: GithubClient, expe
       try { await client.switchAccount(selected); checkLogin = true; }
       catch (error) {
         if (error instanceof Cancelled) throw error;
-        ui.text('外部 gh 账号切换未完成；原始输出已隐藏，不会自动重试或恢复。可明确选择浏览器登录，或返回。');
+        ui.error('外部 gh 账号切换未完成；原始输出已隐藏，不会自动重试或恢复。可明确选择浏览器登录，或返回。');
       }
     } else if (choice === 2) {
       if (await client.browserLogin(ui)) checkLogin = true;

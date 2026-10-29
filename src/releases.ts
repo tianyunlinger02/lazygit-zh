@@ -136,7 +136,7 @@ export async function downloadReleaseAssetGuided(ui: Console, session: GithubSes
   for (;;) {
     let name: string;
     try { name = filename(await ui.ask('保存文件名', defaultName)); }
-    catch (error) { if (!(error instanceof GitError)) throw error; ui.text(error.message); continue; }
+    catch (error) { if (!(error instanceof GitError)) throw error; ui.error(error.message); continue; }
     const destination = path.join(parent, name), expected = await downloadTargetSnapshot(destination);
     if (expected) {
       const choice = await ui.menu(`保存文件已存在：${safeDisplay(destination)}`, ['换一个保存文件名', '明确覆盖此本地文件（校验成功后原子替换）']);
@@ -146,7 +146,7 @@ export async function downloadReleaseAssetGuided(ui: Console, session: GithubSes
     const details = `Release #${selected.id}\n附件 #${asset.id} · ${asset.name}\n大小：${asset.size} bytes\n保存到：${destination}${expected ? `\n将替换原文件：${expected.size} bytes\n原文件 SHA-256：${expected.hash}\n下载或校验失败保留原文件；不会先删除旧文件。` : '\n写入新文件，不覆盖已有文件。'}`;
     if (!await (expected ? confirmGithubWrite(ui, session, context, '明确覆盖本地 Release 附件', details, { scope: 'local' }) : confirmGithubRoutine(ui, session, context, '下载 Release 附件并写入新文件', details))) return;
     await downloadReleaseAsset(session.client, context, asset, destination, expected ? { overwrite: true, expected } : {});
-    ui.text('附件下载成功；未运行下载文件。'); return;
+    ui.success('附件下载成功；未运行下载文件。'); return;
   }
 }
 async function assetsMenu(ui: Console, session: GithubSession, context: RepositoryContext, selected: Release): Promise<void> {
@@ -163,7 +163,7 @@ async function assetsMenu(ui: Console, session: GithubSession, context: Reposito
         if (current.tag !== selected.tag) throw new GitError('Release Tag 已改变，请重新选择。');
         const rechecked = await Promise.all(files.map(assetSnapshot));
         if (rechecked.some((hash, index) => hash !== snapshots[index])) throw new GitError('确认期间附件内容改变，请重新预览。');
-        await session.client.uploadRelease(context, selected.tag, files, { clobber }); ui.text('附件上传请求已完成；请用列表核对全部附件。'); return;
+        await session.client.uploadRelease(context, selected.tag, files, { clobber }); ui.warn('附件上传请求已完成；请用列表核对全部附件。'); return;
       }
       const asset = await pagedSelection(ui, 'Release assets', (page) => listReleaseAssets(session.client, context, selected.id, page), (asset) => `#${asset.id} ${asset.name} · ${asset.size} bytes · ${asset.state}`); if (!asset) return;
       if (choice === 1) { ui.text(safeDisplay(JSON.stringify(asset, null, 2))); return; }
@@ -212,7 +212,7 @@ export async function tagsMenu(ui: Console, session: GithubSession, context: Rep
         if (choice === 4 && await repo.value('rev-parse', '--verify', ref) !== target) throw new GitError('确认期间本地 Tag 改变。');
         await transport.git.run(['push', '--no-follow-tags', '--', transport.remote, choice === 5 ? `:${ref}` : `${target}:${ref}`], { interactive: true });
       }
-      ui.text('明确选择的 Tag 操作已完成；没有创建 Release 或推送其它引用。');
+      ui.success('明确选择的 Tag 操作已完成；没有创建 Release 或推送其它引用。');
     });
   }
 }
@@ -227,7 +227,7 @@ export async function releasesMenu(ui: Console, directory: string): Promise<void
       if (choice === 2) {
         const tag = inputText(await ui.ask('已经存在的远程 Tag')), name = inputText(await ui.ask('Release 标题', tag)), body = await readBody(ui);
         const mode = await ui.menu('发布方式', ['Draft 草稿', '正式发布', '预发布']); if (!mode) return;
-        if (await confirmGithubWrite(ui, session, context, '创建 Release', `Tag：${tag}\n标题：${name}\n模式：${['Draft', '正式发布', '预发布'][mode - 1]}\n正文：\n${body}\n不隐式创建或 push Tag。`)) { const release = await createRelease(session.client, context, tag, name, body, mode === 1, mode === 3); ui.text(`已创建 Release #${release.id}。`); } return;
+        if (await confirmGithubWrite(ui, session, context, '创建 Release', `Tag：${tag}\n标题：${name}\n模式：${['Draft', '正式发布', '预发布'][mode - 1]}\n正文：\n${body}\n不隐式创建或 push Tag。`)) { const release = await createRelease(session.client, context, tag, name, body, mode === 1, mode === 3); ui.success(`已创建 Release #${release.id}。`); } return;
       }
       const release = await selectRelease(ui, session, context); if (!release) return;
       if (choice === 1) { const full = await viewRelease(session.client, context, release.id); ui.text(safeDisplay(`Release #${full.id} · ${full.tag}\n${full.name}\n${full.draft ? 'Draft' : 'Published'}${full.prerelease ? ' · Prerelease' : ''}\n${full.body}`)); return; }
@@ -239,7 +239,7 @@ export async function releasesMenu(ui: Console, directory: string): Promise<void
         else { const mode = await ui.menu('预发布状态', ['正式发布', '预发布']); if (!mode) return; patch = { prerelease: mode === 2 }; }
         if (await confirmGithubWrite(ui, session, context, '编辑 Release', `Release #${release.id} · ${release.tag}\n${JSON.stringify(patch)}`)) await editRelease(session.client, context, release.id, patch);
       } else if (choice === 4) {
-        if (!release.draft) { ui.text('此 Release 已发布，不是 Draft。'); return; }
+        if (!release.draft) { ui.warn('此 Release 已发布，不是 Draft。'); return; }
         if (await confirmGithubWrite(ui, session, context, '发布 Draft Release', `Release #${release.id} · ${release.tag}\n标题：${release.name}\n正文与附件将按当前远程内容发布。`)) await editRelease(session.client, context, release.id, { draft: false });
       } else if (choice === 5) { if (await confirmGithubWrite(ui, session, context, '永久删除 Release 及全部远程附件', `Release #${release.id} · ${release.tag}\n不删除本地或远程 Tag。`)) await deleteRelease(session.client, context, release.id); }
       else if (choice === 6) await assetsMenu(ui, session, context, release);

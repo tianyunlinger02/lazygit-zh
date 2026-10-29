@@ -5,9 +5,13 @@ import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 
 import { Change, Git, GitError, decodePath, encodePath, redact, splitNul, validateGitUrl } from './git.js';
-import { GithubClient, authenticateGithub, validateRepositoryName, type Visibility } from './github.js';
+import { safeDisplay } from './github.js';
+import { confirmPersonalRepository, createPersonalRepository, preparePersonalRepository } from './personal-repository.js';
+import { DEFAULT_HOST, DEFAULT_TRANSPORT, HostStore, resolveTransport, validateTransport, type TransportTarget } from './hosts.js';
+import { TaskProgress, withTask } from './task-progress.js';
+import type { CredentialPin } from './credential-pin.js';
 import type { Profile } from './profiles.js';
-import type { Console } from './ui.js';
+import { Cancelled, type Console } from './ui.js';
 import { chooseCloneTarget, verifyCloneTarget } from './clone-target.js';
 import { autoIgnoreLargeFiles } from './large-files.js';
 import { currentSession } from './session.js';
@@ -20,10 +24,14 @@ export interface RemoteTarget {
     readonly owner: string;
     readonly name: string;
     readonly profile: Readonly<Profile>;
+    readonly transport?: Readonly<TransportTarget>;
+    readonly address: string;
+    readonly pin?: CredentialPin;
   };
+  readonly stopAfterAssociation?: boolean;
 }
 
-export interface PushOptions { remote?: string; target?: RemoteTarget; mode?: 'normal' | 'lease' | 'force'; branch?: string }
+export interface PushOptions { remote?: string; target?: RemoteTarget; mode?: 'normal' | 'lease' | 'force'; branch?: string; task?: TaskProgress }
 
 export async function remoteRefOid(repo: Git, address: string, ref: string): Promise<string> {
   if (!ref.startsWith('refs/') || (await repo.run(['check-ref-format', ref], { check: false })).status) throw new GitError('远端引用无效。');
@@ -127,26 +135,33 @@ async function availableRemoteName(repo: Git, name: string): Promise<void> {
 }
 
 /** Resolve both URL rewrite directions offline; a created repository is never a generic destination. */
-async function validateCreatedTarget(repo: Git, remote: string, owner: string, name: string): Promise<void> {
-  const expected = `git@github.com:${owner}/${name}.git`.toLowerCase();
+async function validateCreatedTarget(repo: Git, remote: string, owner: string, name: string, transport: TransportTarget, address: string): Promise<void> {
+  const expected = transport.mode === 'https' ? `https://github.com/${owner}/${name}.git` : `git@github.com:${owner}/${name}.git`;
+  if (address.toLowerCase() !== expected.toLowerCase() || !(transport.mode === 'https' ? address.startsWith('https://github.com/') : address.startsWith('git@github.com:'))) throw new GitError('新建仓库地址与已确认的账号、仓库或传输不一致，已停止。');
   for (const push of [false, true]) {
     const urls = await repo.remoteUrls(remote, push);
-    if (urls.length === 1 && urls[0].startsWith('git@github.com:') && urls[0].toLowerCase() === expected) continue;
-    throw new GitError('Git URL 重写或远程配置使实际获取/推送目标不再是预期 github.com 仓库的规范 SSH 地址，已拒绝继续上传。即使 HTTPS 指向同一仓库，也不能改用外部 HTTPS 凭据代替所选托管密钥；请检查 URL 重写及 pushurl 配置。');
+    if (urls.length === 1 && urls[0] === address) continue;
+    throw new GitError('Git URL 重写或远程配置使实际获取/推送目标不再是预期 github.com 仓库的规范地址，已拒绝继续上传。不能换协议、使用外部凭据或多个地址；请检查 URL 重写及 pushurl 配置。');
   }
 }
 
 async function createdTargetContext(repo: Git, target?: RemoteTarget): Promise<Git> {
   if (!target?.created) return repo;
-  const { profile: expected, owner, name } = target.created;
+  const { profile: expected, owner, name, address, pin } = target.created;
+  const transport = await resolveTransport(repo.directory);
+  if (!isDeepStrictEqual(transport, target.created.transport)) throw new GitError('项目传输配置在建库后发生变化，已停止上传；仓库与本地提交会保留。');
+  const effective = personalUploadTransport(transport);
   const { profileGit, ProfileStore, resolveBinding } = await import('./profiles.js');
-  const current = await new ProfileStore().load(expected.profile_id);
+  const current = await new ProfileStore().load(expected.profile_id, effective.mode === 'managed-ssh');
   const binding = await resolveBinding(repo.directory);
   if (!binding || !isDeepStrictEqual({ ...current }, expected) || !isDeepStrictEqual({ ...binding }, expected)) {
     throw new GitError('新建仓库选定的账号或项目绑定已发生变化，已拒绝上传；请重新核对。已创建的仓库和本地提交会保留。');
   }
-  const runner = await profileGit(repo.directory, current);
-  await validateCreatedTarget(runner, target.remote, owner, name);
+  if (effective.mode === 'https' && !pin) throw new GitError('本次 HTTPS 创建任务缺少已核验的凭据固定信息，未上传。');
+  await pin?.assertCurrent();
+  const runner = await profileGit(repo.directory, current, effective, address, pin);
+  await validateCreatedTarget(runner, target.remote, owner, name, effective, address);
+  await unchangedRemoteTarget(runner, target);
   return runner;
 }
 
@@ -173,92 +188,149 @@ function oneTimeRemote({ remote, target }: PushOptions): string | undefined {
   return target?.remote ?? remote;
 }
 
-async function createPersonalRemote(ui: Console, repo: Git): Promise<RemoteTarget | undefined> {
-  // Local validation precedes every API call, including authentication.
-  const remote = await ui.ask('给这个远程起一个名字', 'origin');
-  await availableRemoteName(repo, remote);
+function personalUploadTransport(configured: TransportTarget | undefined): TransportTarget {
+  const target = validateTransport(configured ?? DEFAULT_TRANSPORT), host = target.host;
+  const github = host.provider === 'github' && host.host === 'github.com';
+  const session = currentSession();
+  const https = target.mode === 'https' && target.credentials !== 'external' && !!session && !session.closed;
+  const ssh = target.mode === 'managed-ssh' && host.sshHost === 'github.com' &&
+    (!host.sshAlias || host.sshAlias === 'github.com') && (host.sshPort === undefined || host.sshPort === 22) && (!host.sshUser || host.sshUser === 'git');
+  if (!github || !https && !ssh) throw new GitError('内置个人建库并关联需要 github.com 的托管 HTTPS（当前加密 Token）或托管 SSH。当前项目选择了其他主机、外部 HTTPS 或原生 SSH；尚未创建仓库。请在“账号与资料 → 项目主机”明确调整，或使用“关联已有仓库”。不会自动修改已有传输配置。');
+  return target;
+}
+
+async function personalTransport(ui: Console, directory: string, task: TaskProgress): Promise<TransportTarget | undefined> {
+  const configured = await resolveTransport(directory);
+  if (configured) return personalUploadTransport(configured);
+  const choice = await ui.menu('本项目的新仓库使用哪种传输？（选定后保存到本项目）', ['HTTPS（推荐，使用加密 Token，无需 SSH 密钥）', '托管 SSH（使用已有 AutoGit 密钥，需授权公钥）']);
+  if (!choice) return undefined;
+  if (await resolveTransport(directory) !== undefined) throw new GitError('项目传输在选择期间已被配置，未覆盖；请重新进入并核对。');
+  const target = validateTransport({ mode: choice === 1 ? 'https' : 'managed-ssh', host: { ...DEFAULT_HOST } });
+  personalUploadTransport(target);
+  await new HostStore().set(directory, target);
+  task.note(`已明确保存本项目传输：${target.mode === 'https' ? '托管 HTTPS' : '托管 SSH'}；取消后此设置仍会保留。`);
+  ui.text('已保存本项目传输选择；不修改全局设置或已有远程地址，随后取消不会撤销此设置。');
+  return target;
+}
+
+async function newRemoteName(ui: Console, repo: Git): Promise<string> {
+  const names = await repo.remotes();
+  if (!names.includes('origin')) {
+    ui.text('本地远程别名自动使用 origin：它只是这个地址在本地的简称，不是 GitHub 仓库名。');
+    return 'origin';
+  }
+  let index = 2;
+  while (names.includes(`origin-${index}`)) index++;
+  ui.text('origin 已存在，将保留原地址和上游。请给这次的新地址选另一个本地别名。');
+  for (;;) {
+    const name = await ui.ask('新地址的本地远程别名', `origin-${index}`);
+    try { await availableRemoteName(repo, name); return name; }
+    catch (error) { if (!(error instanceof GitError)) throw error; ui.error(error.message); }
+  }
+}
+
+async function createPersonalRemote(ui: Console, repo: Git, task: TaskProgress): Promise<RemoteTarget | undefined> {
+  await repo.ensureReady();
+  const effective = await personalTransport(ui, repo.directory, task);
+  if (!effective) return undefined;
+  const configured = await resolveTransport(repo.directory);
+  if (!isDeepStrictEqual(personalUploadTransport(configured), effective)) throw new GitError('项目传输在选择期间已变化，未继续创建。');
+  const transportSnapshot = configured ? Object.freeze({ ...configured, host: Object.freeze({ ...configured.host }) }) : undefined;
   const { bindProject, chooseProfile, profileGit, ProfileStore, resolveBinding } = await import('./profiles.js');
   const binding = await resolveBinding(repo.directory);
-  const profile = binding ?? await chooseProfile(ui);
+  const profile = binding ?? await chooseProfile(ui, { createHttps: effective.mode === 'https' });
   if (profile == null) {
-    ui.text('未选择 AutoGit 账号，没有创建或关联仓库。请先到“账号与密钥”新建或导入。');
+    ui.text('未选择 AutoGit 账号，没有创建或关联仓库。');
     return undefined;
   }
-  const snapshot = { ...profile };
-  const bindingSnapshot = binding ? { ...binding } : undefined;
+  const snapshot = { ...profile }, bindingSnapshot = binding ? { ...binding } : undefined;
   const store = new ProfileStore();
-  const checkProfile = async (): Promise<Git> => {
-    const current = await store.load(profile.profile_id);
-    const currentBinding = await resolveBinding(repo.directory);
+  const checkProfile = async (address?: string, pin?: CredentialPin): Promise<Git> => {
+    const current = await store.load(profile.profile_id, effective.mode === 'managed-ssh'), currentBinding = await resolveBinding(repo.directory);
     if (!isDeepStrictEqual({ ...current }, snapshot) || !isDeepStrictEqual(currentBinding ? { ...currentBinding } : undefined, bindingSnapshot)) {
       throw new GitError('账号或项目绑定在选择期间发生变化，已停止；请重新预览，不会自动更换项目账号。');
     }
-    return profileGit(repo.directory, current);
+    if (!isDeepStrictEqual(await resolveTransport(repo.directory), transportSnapshot)) throw new GitError('项目传输配置在选择期间发生变化，已停止；请重新预览。');
+    await pin?.assertCurrent();
+    return profileGit(repo.directory, current, effective, address, pin);
   };
   let runner = await checkProfile();
   await runner.ensureReady();
-  ui.text(`AutoGit 账号：${profile.label}；预期 GitHub 登录名：${profile.github_login}。${binding ? '沿用项目现有绑定，不会更换账号。' : '仅在远程关联成功后绑定项目。'}`);
-  // Never sanitize or silently substitute the directory's (possibly Chinese) name.
-  const name = validateRepositoryName(await ui.ask('新 GitHub 仓库名称（请明确输入普通仓库名，不自动使用文件夹名）'));
-  const choice = await ui.menu('仓库可见性（必须明确选择）', ['Private 私有（推荐）', 'Public 公开（任何人都能看到）']);
-  if (!choice) return undefined;
-  const visibility: Visibility = choice === 1 ? 'private' : 'public';
-  const owner = profile.github_login;
-  const client = new GithubClient(repo.directory);
-  const login = await authenticateGithub(ui, client, owner);
-  if (!login) return undefined;
-  ui.text(`GitHub API 登录：${login}\nAutoGit 账号：${profile.label}\n预期登录 / 仓库所有者：${owner}\n仓库：${owner}/${name}\n可见性：${visibility}\n项目：${repo.directory}\n本地远程名：${remote}`);
-  ui.text('将创建一个空仓库，不添加 README、.gitignore 或许可证。此步骤只创建并关联，不会提交或推送。');
-  if (!(await ui.confirm('最终确认：以以上 API 账号创建这个 GitHub 空仓库并关联当前项目？'))) return undefined;
-  runner = await checkProfile();
-  await runner.ensureReady();
-  await availableRemoteName(runner, remote);
-  let createdUrl = '';
-  let linked = false;
-  const onCreated = (url: string): void => {
-    createdUrl = url;
-    ui.text(`GitHub 仓库已创建：${url}`);
-  };
-  try {
-    const created = await client.createRepository(owner, name, visibility, onCreated);
-    if (!createdUrl) onCreated(created.htmlUrl);
+  ui.text(safeDisplay(`AutoGit 账号：${profile.label}；预期 GitHub 登录名：${profile.github_login}。${binding ? '沿用项目现有绑定，不会更换账号。' : '仅在远程关联成功后绑定项目。'}`));
+  const draft = await preparePersonalRepository(ui, repo.directory, profile.github_login, async () => { runner = await checkProfile(); await runner.ensureReady(); }, task);
+  if (!draft) return undefined;
+  const { client, owner, name } = draft;
+  const remote = await newRemoteName(ui, runner);
+  const details = `GitHub API 登录：${owner}\nAutoGit 账号：${profile.label}\n项目：${repo.directory}\n本地远程别名：${remote}\n传输：${effective.mode === 'https' ? '托管 HTTPS（使用本次已核验 Token，无需 SSH）' : '托管 SSH（需公钥已授权）'}\n此步骤创建并关联，不提交或推送；后续上传仍会核对目标。`;
+  if (!await confirmPersonalRepository(ui, draft, details)) return undefined;
+  const beforeWrite = async (): Promise<void> => {
     runner = await checkProfile();
+    await runner.ensureReady();
     await availableRemoteName(runner, remote);
-    await runner.run(['remote', 'add', remote, created.sshUrl]);
+  };
+  await beforeWrite();
+  const result = await createPersonalRepository(ui, draft, beforeWrite, task);
+  if (!result) return undefined;
+  const { repository: created, recovered } = result;
+  if (recovered) {
+    ui.text(safeDisplay(`${details}\n已核对远端：${created.htmlUrl}。只继续本地关联，不创建、提交或上传。`));
+    if (!await ui.confirm('明确继续：关联以上已存在仓库？（不会重复创建或自动上传）')) return undefined;
+  }
+  const address = effective.mode === 'https' ? created.httpsUrl : created.sshUrl;
+  const pin = effective.mode === 'https' ? client.credentialPin() : undefined;
+  if (pin) task.cleanup(() => pin.dispose());
+  let linked = false;
+  try {
+    await beforeWrite();
+    runner = await checkProfile(address, pin);
+    task.start('associate', '关联本地项目');
+    await runner.run(['remote', 'add', remote, address]);
     linked = true;
-    ui.text(`已关联远程 ${remote} → ${created.sshUrl}。尚未提交或上传。`);
-    await validateCreatedTarget(runner, remote, owner, name);
-    await checkProfile();
-    if (!binding) await bindProject(repo.directory, profile);
-    ui.text(`项目沿用 AutoGit 账号：${profile.label}。创建和关联已完成；尚未提交或推送。`);
-    return Object.freeze({ remote, created: Object.freeze({ owner, name, profile: Object.freeze(snapshot) }) });
+    task.set('associate', 'partial', `${remote} → ${address} 已写入，目标和账号绑定仍待核对。`);
+    ui.success(`已关联远程 ${remote} → ${address}。尚未提交或上传。`);
+    await validateCreatedTarget(runner, remote, owner, name, effective, address);
+    await checkProfile(address, pin);
+    if (!binding) await bindProject(repo.directory, profile, effective);
+    task.set('associate', 'done', `${remote} → ${address}；账号 ${profile.github_login}。`);
+    ui.success(`项目沿用 AutoGit 账号：${profile.label}。创建和关联已完成；尚未提交或推送。`);
+    const urls = Object.freeze({ fetch: Object.freeze(await runner.remoteUrls(remote)), push: Object.freeze(await runner.remoteUrls(remote, true)) });
+    return Object.freeze({ remote, urls, ...(recovered ? { stopAfterAssociation: true } : {}), created: Object.freeze({ owner, name, address, pin, profile: Object.freeze(snapshot), transport: transportSnapshot }) });
   } catch (error) {
-    if (createdUrl) {
-      ui.text(`已完成：GitHub 仓库已创建 ${createdUrl}；本地远程${linked ? `已关联为 ${remote}` : '尚未关联'}。仓库会保留，不自动删除或回滚。尚未提交或推送。`);
-    }
+    if (!linked) task.set('associate', 'failed', '未确认关联成功；远端仓库保留。');
+    ui.warn(`远端仓库 ${created.htmlUrl} 会保留；本地远程${linked ? `已关联为 ${remote}，后续核对或绑定未完成` : '尚未确认关联'}。不会自动删除或回滚，尚未提交或推送。`);
     throw error;
   }
 }
 
-async function addRemoteTarget(ui: Console, repo: Git): Promise<RemoteTarget | undefined> {
+async function addRemoteTarget(ui: Console, repo: Git, existing?: TaskProgress): Promise<RemoteTarget | undefined> {
+  return withTask(ui, existing, task => addRemoteTargetTask(ui, repo, task));
+}
+
+async function addRemoteTargetTask(ui: Console, repo: Git, task: TaskProgress): Promise<RemoteTarget | undefined> {
   ui.title('关联远程仓库');
   for (const name of await repo.remotes()) ui.text(`已有 ${name}：${redact((await repo.remoteUrls(name)).join(', '))}`);
-  const choice = await ui.menu('选择关联方式', ['新建个人 GitHub 空仓库（私有 / 公开）', '关联已有仓库（手工粘贴地址，无需 GitHub CLI）']);
+  const choice = await ui.menu('选择关联方式', ['新建个人 GitHub 空仓库（内置，无需 gh；私有 / 公开）', '关联已有仓库（手工粘贴地址，无需 GitHub CLI）']);
   if (!choice) return undefined;
-  if (choice === 1) return createPersonalRemote(ui, repo);
+  if (choice === 1) return createPersonalRemote(ui, repo, task);
+  task.set('create', 'not-applicable', '关联已有仓库，不新建。');
   ui.text('粘贴已有仓库地址即可；若尚未建库，可返回选择新建，或访问 https://github.com/new。');
   const address = validateGitUrl(await ui.ask('粘贴 Git 仓库地址（SSH/HTTPS，支持其他服务及 SSH Host alias）'));
   const name = await ui.ask('给这个远程起一个名字', 'origin');
   await availableRemoteName(repo, name);
   if (!(await ui.routineConfirm(`在当前仓库关联 ${name} → ${address}？（不会联网或创建 GitHub 仓库）`))) return undefined;
   await availableRemoteName(repo, name);
+  task.start('associate', '关联已有远程');
   await repo.run(['remote', 'add', name, address]);
+  task.set('associate', 'done', `${name} → ${address}；仅记录地址，未验证推送权限。`);
   ui.text('已关联远程。仅记录了地址，不代表认证或推送已经成功。');
   return snapshotRemoteTarget(repo, name);
 }
 
-export async function addRemote(ui: Console, repo: Git): Promise<string> {
-  return (await addRemoteTarget(ui, repo))?.remote ?? '';
+export async function addRemote(ui: Console, repo: Git, existing?: TaskProgress): Promise<string> {
+  return withTask(ui, existing, async task => {
+    if (!existing) for (const stage of ['commit', 'upload', 'upstream'] as const) task.set(stage, 'not-applicable', '本次仅添加远程。');
+    return (await addRemoteTarget(ui, repo, task))?.remote ?? '';
+  });
 }
 
 /** Accept supported Git transports and existing local bare repositories. */
@@ -287,14 +359,16 @@ export async function validateExistingRemote(repo: Git, name: string, push = fal
   return urls;
 }
 
-async function chooseRemoteTarget(ui: Console, repo: Git): Promise<RemoteTarget | undefined> {
+async function chooseRemoteTarget(ui: Console, repo: Git, task?: TaskProgress): Promise<RemoteTarget | undefined> {
   const remotes = await repo.remotes();
-  if (!remotes.length) return addRemoteTarget(ui, repo);
+  if (!remotes.length) return addRemoteTarget(ui, repo, task);
   const targets = await Promise.all(remotes.map((remote) => snapshotRemoteTarget(repo, remote)));
   const options = targets.map((target) => `${target.remote} → ${redact(target.urls!.push.join(', '))}`);
   const choice = await ui.menu('选择远程', [...options, '关联另一个远程']);
   if (!choice) return undefined;
-  if (choice === remotes.length + 1) return addRemoteTarget(ui, repo);
+  if (choice === remotes.length + 1) return addRemoteTarget(ui, repo, task);
+  task?.set('associate', 'reused', targets[choice - 1].remote);
+  if (task?.status('create') === 'pending') task.set('create', 'not-applicable', '使用已有远程，不新建仓库。');
   return targets[choice - 1];
 }
 
@@ -313,9 +387,9 @@ export async function remoteContext(ui: Console, repo: Git, urls: string[]): Pro
   if (httpsUrl && currentSession() && transport?.credentials !== 'external') {
     const host = new URL(httpsUrl).hostname;
     const httpsTransport = transport?.mode === 'https' ? transport : { mode: 'https' as const, host: { provider: host === 'github.com' ? 'github' as const : 'generic' as const, host, apiHost: host === 'github.com' ? 'api.github.com' : '', webBase: `https://${host}`, sshHost: host } };
-    const profile = binding ?? await chooseProfile(ui);
+    const profile = binding ?? await chooseProfile(ui, { createHttps: true });
     if (profile == null) throw new GitError('托管 HTTPS 必须选择 AutoGit 账号；没有联网。请先到“账号与密钥”新建或绑定。');
-    if (!binding) { if (!(await ui.routineConfirm(`此项目使用 ${profile.label} 的托管 HTTPS Token？`))) throw new GitError('已取消账号绑定，未联网。'); await bindProject(repo.directory, profile); }
+    if (!binding) { if (!(await ui.routineConfirm(`此项目使用 ${profile.label} 的托管 HTTPS Token？`))) throw new GitError('已取消账号绑定，未联网。'); await bindProject(repo.directory, profile, httpsTransport); }
     return (await profileGit(repo.directory, profile, httpsTransport, urls.length === 1 ? httpsUrl : undefined)).repository();
   }
   if (transport?.mode === 'native-ssh' || transport?.mode === 'https') return (await projectGit(repo.directory)).repository();
@@ -342,10 +416,17 @@ export async function protectAccountData(repo: Git, changes: Change[]): Promise<
 }
 
 export async function push(ui: Console, original: Git, options: PushOptions = {}): Promise<void> {
+  return withTask(ui, options.task, task => pushTask(ui, original, { ...options, task }));
+}
+
+async function pushTask(ui: Console, original: Git, options: PushOptions & { task: TaskProgress }): Promise<void> {
+  const task = options.task;
+  if (task.status('commit') === 'pending') task.set('commit', 'reused', '本次仅上传已有提交。');
   const mode = options.mode ?? 'normal';
   if (!['normal', 'lease', 'force'].includes(mode)) throw new GitError('推送方式无效。');
   const explicitRemote = oneTimeRemote(options);
   let selection = options.target;
+  if (selection?.stopAfterAssociation) return;
   let repo = await (await projectGit(original.directory)).repository();
   repo = await createdTargetContext(repo, selection);
   await unchangedRemoteTarget(repo, selection);
@@ -364,8 +445,8 @@ export async function push(ui: Console, original: Git, options: PushOptions = {}
   let separatePush = Boolean(upstreamRemote && remote && upstreamRemote !== remote);
   if (!hasExplicitRemote && upstreamRemote && !branchPushRemote && !defaultPushRemote && (await repo.remotes()).length > 1) {
     ui.text('此项目有多个远程。拉取上游不一定是你可上传的仓库，请明确选择推送目标。');
-    selection = await chooseRemoteTarget(ui, repo);
-    if (!selection) return;
+    selection = await chooseRemoteTarget(ui, repo, task);
+    if (!selection || selection.stopAfterAssociation) return;
     remote = selection.remote;
     separatePush = remote !== upstreamRemote;
   }
@@ -382,8 +463,8 @@ export async function push(ui: Console, original: Git, options: PushOptions = {}
     setUpstream = false;
   } else if (setUpstream) {
     ui.text('当前分支还没有设置上游（默认同步目标），请明确选择。');
-    selection = await chooseRemoteTarget(ui, repo);
-    if (!selection) return;
+    selection = await chooseRemoteTarget(ui, repo, task);
+    if (!selection || selection.stopAfterAssociation) return;
     remote = selection.remote;
     const target = options.branch ?? await ui.ask('远程分支名称', branch);
     mergeRef = `refs/heads/${target}`;
@@ -396,7 +477,9 @@ export async function push(ui: Console, original: Git, options: PushOptions = {}
   repo = await createdTargetContext(repo, selection);
   await unchangedRemoteTarget(repo, selection);
   const urls = await validateExistingRemote(repo, remote, true);
-  repo = await remoteContext(ui, repo, urls);
+  if (!selection?.created) repo = await remoteContext(ui, repo, urls);
+  if (task.status('associate') === 'pending') task.set('associate', 'reused', `${remote} → ${urls[0]}`);
+  if (task.status('create') === 'pending') task.set('create', 'not-applicable', '使用已有远程，不新建仓库。');
   const preview = await snapshotRemoteTarget(repo, remote);
   if (!isDeepStrictEqual(preview.urls!.push, urls)) throw new GitError('上传目标在预览期间发生变化，已停止；请重新选择。');
   const sourceOid = await repo.value('rev-parse', 'HEAD');
@@ -430,27 +513,38 @@ export async function push(ui: Console, original: Git, options: PushOptions = {}
   const args = ['push', '--no-follow-tags'];
   if (mode === 'lease') args.push(`--force-with-lease=${mergeRef}:${remoteOid}`);
   else if (mode === 'force') args.push('--force');
+  task.start('upload', '上传代码');
   try {
     await repo.run([...args, '--', remote, `${sourceOid}:${mergeRef}`], { interactive: true });
+    task.set('upload', 'done', `${urls[0]} · ${mergeRef} · ${sourceOid}`);
   } catch (error) {
+    task.set('upload', 'unknown', `${urls[0]} · ${mergeRef}；远端未确认，本地提交 ${sourceOid} 保留。`);
+    if (error instanceof Cancelled) throw new Cancelled('上传已中断，远端结果未知；本地提交仍在。请先检查远端，不会自动重试或强推。', true);
     if (!(error instanceof GitError)) throw error;
     throw new GitError(`上传没有确认成功，本地提交仍在；请先检查远端结果再重试。\n若提示 rejected/fetch first，可先获取更新；若本地历史已分叉，请使用外部 Git 处理后重试，不要用强推解决本地分叉。仅在确实需要改写远端历史时，在远程工具明确选择 lease 或无条件 force。没有自动升级推送方式。\n${error.message}`);
   }
-  ui.text(`${mode === 'normal' ? '推送' : '强推'}成功：远程已接受本次上传。`);
+  ui.success(`${mode === 'normal' ? '推送' : '强推'}成功：远程已接受本次上传。`);
   if (setUpstream) {
+    let wroteRemote = false;
     try {
       if (await repo.branch() !== branch || await repo.value('rev-parse', 'HEAD') !== sourceOid ||
           await repo.config(`branch.${branch}.remote`) !== upstreamRemote || await repo.config(`branch.${branch}.merge`) !== initialMergeRef) {
-        ui.text('远端上传已成功，但本地分支或上游配置在上传期间变化；没有替换现在的上游。');
+        task.set('upstream', 'partial', '上传已成功，但分支或配置变化；未替换现有配置。');
+        ui.warn('远端上传已成功，但本地分支或上游配置在上传期间变化；没有替换现在的上游。');
         return;
       }
+      task.start('upstream', '设置默认同步目标');
       await repo.run(['config', `branch.${branch}.remote`, remote]);
+      wroteRemote = true;
+      task.set('upstream', 'partial', 'remote 已保存，merge 引用仍待写入。');
       await repo.run(['config', `branch.${branch}.merge`, mergeRef]);
+      task.set('upstream', 'done', `${remote}/${mergeRef.slice('refs/heads/'.length)}`);
       ui.text(`已设置默认同步目标：${remote}/${mergeRef.slice('refs/heads/'.length)}。`);
     } catch (error) {
-      ui.text(`远端上传已经成功，本地上游关联未完整完成：${redact(error instanceof Error ? error.message : String(error))}。请单独检查配置，不必重复上传。`);
+      task.set('upstream', wroteRemote ? 'partial' : 'failed', wroteRemote ? 'remote 已保存，merge 引用未确认；不要重复上传。' : '未确认设置完成；远端上传已经成功。');
+      ui.warn(`远端上传已经成功，本地上游关联未完整完成：${redact(error instanceof Error ? error.message : String(error))}。请单独检查配置，不必重复上传。`);
     }
-  }
+  } else task.set('upstream', 'reused', '保留原拉取上游和推送配置。');
 }
 
 export async function riskyPaths(repo: Git, changes: Change[]): Promise<string[]> {
@@ -478,9 +572,20 @@ function sameChanges(left: Change[], right: Change[]): boolean {
   });
 }
 
-export async function saveAndPush(ui: Console, directory: string, { upload = true, remote, target }: PushOptions & { upload?: boolean } = {}): Promise<void> {
+export async function saveAndPush(ui: Console, directory: string, options: PushOptions & { upload?: boolean } = {}): Promise<void> {
+  return withTask(ui, options.task, task => saveAndPushTask(ui, directory, { ...options, task }));
+}
+
+async function saveAndPushTask(ui: Console, directory: string, { upload = true, remote, target, task }: PushOptions & { upload?: boolean; task: TaskProgress }): Promise<void> {
+  if (target?.stopAfterAssociation) return;
+  if (!upload) {
+    task.set('create', 'not-applicable', '本次仅保存到本地，不新建远端仓库。');
+    task.set('associate', 'not-applicable', '本次不添加远程。');
+    task.set('upload', 'not-applicable', '本次仅保存到本地。');
+    task.set('upstream', 'not-applicable', '本次不设置远端上游。');
+  }
   const selectedRemote = oneTimeRemote({ remote, target });
-  const pushOptions = { remote: selectedRemote, target };
+  const pushOptions = { remote: selectedRemote, target, task };
   let repo = await (await projectGit(directory)).repository();
   repo = await createdTargetContext(repo, target);
   await unchangedRemoteTarget(repo, target);
@@ -489,10 +594,11 @@ export async function saveAndPush(ui: Console, directory: string, { upload = tru
   for (const name of selectedRemote ? [selectedRemote] : await repo.remotes()) {
     sshUrls.push(...(await repo.remoteUrls(name)).filter((url) => url.startsWith('git@github.com:')));
   }
-  if (sshUrls.length) repo = await remoteContext(ui, repo, sshUrls);
+  if (sshUrls.length && !target?.created) repo = await remoteContext(ui, repo, sshUrls);
   const oversized = await autoIgnoreLargeFiles(ui, repo, await repo.changes());
   const changes = await showStatus(ui, repo);
   if (!changes.length) {
+    task.set('commit', await repo.hasCommits() ? 'reused' : 'pending', '没有新的文件修改。');
     if (upload && await repo.hasCommits() && await ui.routineConfirm('没有新修改，是否检查目标并重试上传已有提交？')) await push(ui, repo, pushOptions);
     return;
   }
@@ -530,6 +636,7 @@ export async function saveAndPush(ui: Console, directory: string, { upload = tru
   }
   const included = [...staged, ...selected];
   if (!included.length) {
+    task.set('commit', await repo.hasCommits() ? 'reused' : 'pending', '没有选择新文件，也没有已有暂存内容。');
     ui.text('没有选择文件，也没有已有暂存内容。未进行暂存或提交。');
     if (upload && await repo.hasCommits() && await ui.routineConfirm('不创建新提交，仅检查目标并上传已有提交？')) await push(ui, repo, pushOptions);
     return;
@@ -554,17 +661,30 @@ export async function saveAndPush(ui: Console, directory: string, { upload = tru
   if (!sameChanges(await repo.changes(), changes)) throw new GitError('选择期间文件状态发生变化。为避免误提交，请重新预览和选择。');
   const paths = selected.flatMap((change) => [change.path, ...(change.original ? [change.original] : [])]);
   if (paths.length) await repo.stagePaths(paths);
+  task.start('commit', '保存本地提交');
   try {
     await repo.run(['commit', '-m', message], { interactive: true });
+    task.set('commit', 'done', 'Git 已确认提交成功；本地提交保留。');
   } catch (error) {
+    if (error instanceof Cancelled) {
+      task.set('commit', 'unknown', '提交被中断，请先检查本地历史，不会自动再次提交。');
+      throw error;
+    }
+    task.set('commit', 'unknown', '未确认是否创建新提交；暂存内容保留，请先检查 HEAD。');
     if (!(error instanceof GitError)) throw error;
-    throw new GitError(`没有创建成功的新提交，不会继续推送。暂存内容保留，请检查后重试。\n${error.message}`);
+    throw new GitError(`本地提交没有确认成功，不会继续推送。暂存内容保留，请先检查 HEAD 和历史，避免重复提交。\n${error.message}`);
   }
-  ui.text(`已保存到本地：${await repo.value('rev-parse', '--short', 'HEAD')}。尚未上传。`);
+  const savedOid = await repo.value('rev-parse', '--short', 'HEAD');
+  task.set('commit', 'done', savedOid);
+  ui.text(`已保存到本地：${savedOid}。尚未上传。`);
   if (upload && await ui.routineConfirm('继续选择上传目标并推送到远程吗？')) await push(ui, repo, pushOptions);
 }
 
-export async function uploadLocal(ui: Console, directory: string, { selectDirectory = true }: { selectDirectory?: boolean } = {}): Promise<string | undefined> {
+export async function uploadLocal(ui: Console, directory: string, options: { selectDirectory?: boolean; task?: TaskProgress } = {}): Promise<string | undefined> {
+  return withTask(ui, options.task, task => uploadLocalTask(ui, directory, { ...options, task }));
+}
+
+async function uploadLocalTask(ui: Console, directory: string, { selectDirectory = true, task }: { selectDirectory?: boolean; task: TaskProgress }): Promise<string | undefined> {
   const location = selectDirectory ? await chooseDirectory(ui, directory) : directory;
   let repo = new Git(location);
   const probe = await repo.run(['rev-parse', '--show-toplevel'], { check: false });
@@ -587,12 +707,12 @@ export async function uploadLocal(ui: Console, directory: string, { selectDirect
     const choice = await ui.menu('本次上传目标', ['使用已有远程（沿用现有推送选择规则）', '新建 GitHub 仓库 / 关联另一个远程（不覆盖 origin）']);
     if (!choice) return location;
     if (choice === 2) {
-      target = await addRemoteTarget(ui, repo);
-      if (!target) return location;
+      target = await addRemoteTarget(ui, repo, task);
+      if (!target || target.stopAfterAssociation) return location;
     }
   } else {
-    target = await addRemoteTarget(ui, repo);
-    if (!target) return location;
+    target = await addRemoteTarget(ui, repo, task);
+    if (!target || target.stopAfterAssociation) return location;
   }
   // Creating a remote may have bound the selected account; refresh before checking identity.
   repo = await projectGit(location);
@@ -606,8 +726,8 @@ export async function uploadLocal(ui: Console, directory: string, { selectDirect
     repo = await projectGit(location);
     await repo.ensureIdentity();
   }
-  if ((await repo.changes()).length) await saveAndPush(ui, location, { target });
-  else if (await repo.hasCommits()) await push(ui, repo, { target });
+  if ((await repo.changes()).length) await saveAndPush(ui, location, { target, task });
+  else if (await repo.hasCommits()) await push(ui, repo, { target, task });
   else ui.text('目录中没有可提交的文件。可以先添加 README 等文件，再运行“保存并上传”。');
   return location;
 }
@@ -671,14 +791,14 @@ export async function clone(ui: Console, directory: string): Promise<string | un
   await runner.run(['clone', '--', address, target], { interactive: true });
   if (cloneTransport) {
     try { const { HostStore } = await import('./hosts.js'); await new HostStore().set(target, cloneTransport); }
-    catch (error) { ui.text(`下载已成功，但传输设置保存未完成：${redact(error instanceof Error ? error.message : String(error))}。目录保留，可在项目工具重新配置。`); }
+    catch (error) { ui.warn(`下载已成功，但传输设置保存未完成：${redact(error instanceof Error ? error.message : String(error))}。目录保留，可在项目工具重新配置。`); }
   }
   if (profile != null) {
     try {
       await bindProject(target, profile);
     } catch (error) {
       if (!(error instanceof Error)) throw error;
-      ui.text(`下载已成功，但账号绑定失败：${redact(error.message)}。请在账号管理重新绑定；目录已保留。`);
+      ui.warn(`下载已成功，但账号绑定失败：${redact(error.message)}。请在账号管理重新绑定；目录已保留。`);
     }
   }
   ui.text('下载成功，已切换到该项目。尚未主动执行其中的任何脚本。');
